@@ -76,8 +76,28 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         writer.close()
 
 
+def is_youtube_host(host: str) -> bool:
+    """Проверяет, относится ли хост к доменам YouTube."""
+    host = host.lower()
+    youtube_domains = [
+        'youtube.com',
+        'googlevideo.com',
+        'ytimg.com',
+        'ggpht.com',
+        'youtu.be',
+        'youtube-nocookie.com',
+        'youtubeeducation.com',
+        'yt.be',
+        'youtube.googleapis.com'
+    ]
+    for domain in youtube_domains:
+        if host == domain or host.endswith('.' + domain):
+            return True
+    return False
+
+
 async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Принимает CONNECT от браузера и перенаправляет поток на внутренний TLS лисенер."""
+    """Принимает CONNECT от браузера. Если запрос идет к YouTube, перенаправляет поток на внутренний TLS лисенер (MITM). Иначе идет напрямую к хосту."""
     try:
         initial_line = await reader.readuntil(b'\r\n')
         line = initial_line.decode('latin-1').strip()
@@ -87,27 +107,61 @@ async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.S
             await writer.drain()
             return
 
+        parts = line.split()
+        if len(parts) < 2:
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await writer.drain()
+            return
+
+        target = parts[1]
+        if ':' in target:
+            target_host, target_port_str = target.split(':', 1)
+            try:
+                target_port = int(target_port_str)
+            except ValueError:
+                target_port = 443
+        else:
+            target_host = target
+            target_port = 443
+
         # Вычитываем заголовки CONNECT
         while True:
             header_line = await reader.readuntil(b'\r\n')
             if header_line == b'\r\n':
                 break
 
+        is_yt = is_youtube_host(target_host)
+
+        if is_yt:
+            log.info(f"🎯 Направление трафика на MITM (внутренний TLS): {target_host}:{target_port}")
+            try:
+                upstream_reader, upstream_writer = await asyncio.open_connection(LISTEN_HOST, INTERNAL_TLS_PORT)
+            except Exception as e:
+                log.error(f"❌ Не удалось связаться с внутренним TLS сервером: {e}")
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await writer.drain()
+                return
+        else:
+            log.info(f"🟢 Обход MITM (напрямую): {target_host}:{target_port}")
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(target_host, target_port),
+                    timeout=CONNECT_TIMEOUT
+                )
+            except Exception as e:
+                log.error(f"❌ Не удалось напрямую подключиться к {target_host}:{target_port}: {e}")
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await writer.drain()
+                return
+
         # Сообщаем браузеру, что туннель построен
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
 
-        # Подключаемся к нашему собственному TLS-порту (8444)
-        try:
-            tls_reader, tls_writer = await asyncio.open_connection(LISTEN_HOST, INTERNAL_TLS_PORT)
-        except Exception as e:
-            log.error(f"❌ Не удалось связаться с внутренним TLS сервером: {e}")
-            return
-
-        # Запускаем мост между браузером и нашей TLS-частью скрипта
+        # Запускаем мост между браузером и апстримом (или внутренним TLS)
         await asyncio.gather(
-            pipe(reader, tls_writer),
-            pipe(tls_reader, writer),
+            pipe(reader, upstream_writer),
+            pipe(upstream_reader, writer),
             return_exceptions=True
         )
 
