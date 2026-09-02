@@ -54,7 +54,43 @@ class HeaderParser:
         return self.buf
 
 
+# Принудиваем связку "хост -> IP" для доменов, чьи нативные A-записи
+# заблэкхолятся оператором (149.154.167.99 / 149.154.166.110).
+# 81.200.113.186 — тот же nginx-веш-хост, но IP не в блэкхоле (SNI DPI
+# пропускает td.ru и google.com).
+# ВАЖНО: сервер принимает ТОЛЬКО SNI google.com / telegram.org — SNI в виде
+# web.telegram.org / www.telegram.org рвёт TLS-хендшейк (таймаут).
+FORCE_IP = {
+    'www.telegram.org': '81.200.113.186',
+    'telegram.org': '81.200.113.186',
+    'td.ru': '81.200.113.186',
+    't.me': '81.200.113.186',
+    't.gd': '81.200.113.186',
+    'tdesktop.com': '81.200.113.186',
+}
+
+
+def sni_for_host(host: str) -> str:
+    """Возвращает SNI-хост для апстрим-подключения исходя из целевого домена.
+    Telegram: nginx выбирает vhost по SNI, поэтому нужно прислать telegram.org.
+    YouTube: Google Edge игнорирует SNI и роутит по Host — гуглим google.com."""
+    telegram_domains = ('telegram.org', 'td.ru', 't.me', 't.gd', 'tdesktop.com')
+    host = host.lower()
+    for d in telegram_domains:
+        if host == d or host.endswith('.' + d):
+            return '://telegram.org'
+    return UPSTREAM_SNI
+
+
 def resolve_ip(host: str) -> str:
+    host = host.lower()
+    if host in FORCE_IP:
+        return FORCE_IP[host]
+    # Суффикс-матчинг: все субдомены (*.telegram.org, *.td.ru, ...) сходим в
+    # принудительно заблэкхол-резолвимся на ту же рабочую связку.
+    for forced_host, forced_ip in FORCE_IP.items():
+        if host.endswith('.' + forced_host):
+            return forced_ip
     try:
         return socket.gethostbyname(host)
     except Exception:
@@ -74,11 +110,10 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         pass
     finally:
         writer.close()
-
-
-def is_youtube_host(host: str) -> bool:
-    """Проверяет, относится ли хост к доменам YouTube."""
+def is_mitm_host(host: str) -> bool:
+    """Проверяет, относится ли хост к доменам MITM (YouTube/Telegram и т.д.)."""
     host = host.lower()
+
     youtube_domains = [
         'youtube.com',
         'googlevideo.com',
@@ -90,12 +125,19 @@ def is_youtube_host(host: str) -> bool:
         'yt.be',
         'youtube.googleapis.com'
     ]
-    for domain in youtube_domains:
+    # Telegram: основной сайт живёт на том же nginx-хосте td.ru
+    # (81.200.113.186), SNI DPI резал именно telegram.org.
+    telegram_domains = [
+        'telegram.org',
+        'td.ru',
+        't.me',
+        't.gd',
+        'tdesktop.com'
+    ]
+    for domain in youtube_domains + telegram_domains:
         if host == domain or host.endswith('.' + domain):
             return True
     return False
-
-
 async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Принимает CONNECT от браузера. Если запрос идет к YouTube, перенаправляет поток на внутренний TLS лисенер (MITM). Иначе идет напрямую к хосту."""
     try:
@@ -130,9 +172,9 @@ async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.S
             if header_line == b'\r\n':
                 break
 
-        is_yt = is_youtube_host(target_host)
+        is_mitm = is_mitm_host(target_host)
 
-        if is_yt:
+        if is_mitm:
             log.info(f"🎯 Направление трафика на MITM (внутренний TLS): {target_host}:{target_port}")
             try:
                 upstream_reader, upstream_writer = await asyncio.open_connection(LISTEN_HOST, INTERNAL_TLS_PORT)
@@ -149,7 +191,7 @@ async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.S
                     timeout=CONNECT_TIMEOUT
                 )
             except Exception as e:
-                log.error(f"❌ Не удалось напрямую подключиться к {target_host}:{target_port}: {e}")
+                log.error(f"❌ Не удалось напрямую подключиться к {target_host}:{target_port}: {e!r}")
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await writer.drain()
                 return
@@ -199,23 +241,24 @@ async def handle_tls_client(reader: asyncio.StreamReader, writer: asyncio.Stream
             return
         method, path = parts[0], parts[1]
 
-        raw_host = parser.headers.get('host', 'youtube.com')
+        raw_host = parser.headers.get('host', 'unknown')
         clean_host = raw_host.split(':')[0]
         ip = resolve_ip(clean_host)
 
-        log.info(f'🔀 SNI-Swap Tunnel: {clean_host} -> {ip} (SNI={UPSTREAM_SNI})')
+        sni = sni_for_host(clean_host)
+        log.info(f'🔀 SNI-Swap Tunnel: {clean_host} -> {ip} (SNI={sni})')
 
-        # Подключаемся к оригинальному IP Google с фейковым SNI
+        # Подключаемся к апстриму с корректным SNI для vhost-подбора nginx
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        
+
         upstream_reader, upstream_writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=UPSTREAM_SNI),
+            asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=sni),
             timeout=CONNECT_TIMEOUT
         )
     except Exception as e:
-        log.error(f"❌ Ошибка соединения с апстримом: {e}")
+        log.error(f"❌ Ошибка соединения с апстримом (handle_tls_client): {e!r}")
         return
 
     # Пересобираем запрос
