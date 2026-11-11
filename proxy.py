@@ -22,7 +22,7 @@ CERTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'certs')
 LISTEN_HOST = '127.0.0.1'
 PROXY_PORT = 8443        # Порт для настроек браузера/curl
 INTERNAL_TLS_PORT = 8444 # Внутренний порт для безопасного хендшейка
-UPSTREAM_SNI = '://google.com'
+UPSTREAM_SNI = 'google.com'
 CONNECT_TIMEOUT = 10
 
 class HeaderParser:
@@ -67,7 +67,34 @@ FORCE_IP = {
     't.me': '81.200.113.186',
     't.gd': '81.200.113.186',
     'tdesktop.com': '81.200.113.186',
+    'relay-chat.adw.team': '81.200.113.186',
+    'panel.adw.team': '81.200.113.186',
 }
+
+# DC-relay: карта "заблокированный DC IP -> список альтернативных IP того же DC".
+# TG-кешка (Desktop) подключается к MTProto по "сырому" IP:443 — у неё нет SNI,
+# нет HTTP-заголовков — просто TCP/TLS-туннель. Сервер принимает MTProto-сессию
+# с ЛЮБОГО IP данного DC (сессия хранится на стороне DC, а не привязана к IP).
+# Поэтому если ISP блэкхолит 194.221.250.50 (DC-2), мы прозрачно рутаим на
+# соседний IP того же DC (194.221.250.51) — клиент не заметит разницы.
+DC_RELAY = {
+    # DC-2 (194.221.250.x)
+    '194.221.250.50': ['194.221.250.51', '194.221.250.52'],
+}
+
+
+def relay_candidates(target_host: str, target_port: int) -> list:
+    """Возвращает список candidate (ip, port) для попытки соединения.
+
+    Если target_host из DC_RELAY — возвращает альтернативные IP того же DC
+    (в порядке списка из DC_RELAY). Иначе — просто один original host.
+    """
+    host = target_host.lower()
+    if host in DC_RELAY:
+        # Порт берём из запроса (обычно 443 для MTProto).
+        # Альтернативные IP того же DC обслуживают тот же порт.
+        return [(ip, target_port) for ip in DC_RELAY[host]]
+    return [(target_host, target_port)]
 
 
 def sni_for_host(host: str) -> str:
@@ -78,7 +105,7 @@ def sni_for_host(host: str) -> str:
     host = host.lower()
     for d in telegram_domains:
         if host == d or host.endswith('.' + d):
-            return '://telegram.org'
+            return 'telegram.org'
     return UPSTREAM_SNI
 
 
@@ -132,7 +159,9 @@ def is_mitm_host(host: str) -> bool:
         'td.ru',
         't.me',
         't.gd',
-        'tdesktop.com'
+        'tdesktop.com',
+        'relay-chat.adw.team',
+        'panel.adw.team',
     ]
     for domain in youtube_domains + telegram_domains:
         if host == domain or host.endswith('.' + domain):
@@ -184,17 +213,28 @@ async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.S
                 await writer.drain()
                 return
         else:
-            log.info(f"🟢 Обход MITM (напрямую): {target_host}:{target_port}")
-            try:
-                upstream_reader, upstream_writer = await asyncio.wait_for(
-                    asyncio.open_connection(target_host, target_port),
-                    timeout=CONNECT_TIMEOUT
-                )
-            except Exception as e:
-                log.error(f"❌ Не удалось напрямую подключиться к {target_host}:{target_port}: {e!r}")
-                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                await writer.drain()
-                return
+            candidates = relay_candidates(target_host, target_port)
+            upstream_reader = upstream_writer = None
+            for idx, (ip, port) in enumerate(candidates):
+                if idx > 0:
+                    log.info(f"🔁 DC-relay: пробуем {ip}:{port} (попытка {idx + 1})")
+                else:
+                    log.info(f"🟢 Обход MITM (напрямую): {ip}:{port}")
+                try:
+                    upstream_reader, upstream_writer = await asyncio.wait_for(
+                        asyncio.open_connection(ip, port),
+                        timeout=CONNECT_TIMEOUT
+                    )
+                    if idx > 0:
+                        log.info(f"✅ DC-relay: соединение установлено через {ip}:{port}")
+                    break
+                except Exception as e:
+                    log.warning(f"⚠️ Не удалось подключиться к {ip}:{port}: {e!r}")
+                    if idx == len(candidates) - 1:
+                        log.error(f"❌ Все candidate для {target_host}:{target_port} исчерпаны")
+                        writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                        await writer.drain()
+                        return
 
         # Сообщаем браузеру, что туннель построен
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
