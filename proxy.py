@@ -5,13 +5,16 @@ Listens on 127.0.0.1:8443, routes through internal TLS on 127.0.0.1:8444.
 """
 
 import asyncio
+import ipaddress
 import ssl
 import os
 import re
 import logging
+import struct
 import sys
 import socket
 import subprocess
+import time
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,6 +96,17 @@ DC_RELAY = {
     # DC-2 (194.221.250.x)
     '194.221.250.50': ['194.221.250.51', '194.221.250.52'],
 }
+
+# Подсети дата-центров Telegram: именно их провайдеры блэкхолят целиком.
+TELEGRAM_DC_NETS = [
+    '149.154.160.0/20',   # DC1-DC4
+    '91.108.56.0/22',     # DC5
+    '194.221.250.0/24',   # дополнительные адреса DC из help.getConfig
+    '194.221.252.0/24',
+    '91.108.4.0/22',      # тестовые DC
+]
+SCAN_CONCURRENCY = 400
+SCAN_CONNECT_TIMEOUT = 1.2
 
 # IPv6-адреса дата-центров Telegram. Их провайдеры обычно не блэкхолят,
 # поэтому при наличии IPv6 Telegram Desktop ходит напрямую (CONNECT [v6]:443).
@@ -634,6 +648,96 @@ def probe_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
         return False
 
 
+async def _scan_open(hosts: list, open_ips: list) -> None:
+    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+
+    async def probe(ip):
+        async with sem:
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, 443), timeout=SCAN_CONNECT_TIMEOUT
+                )
+                writer.close()
+                open_ips.append(ip)
+            except Exception:
+                pass
+
+    await asyncio.gather(*(probe(ip) for ip in hosts))
+
+
+async def _is_mtproto(ip: str, timeout: float = 3.0) -> bool:
+    """Проверяет, отвечает ли адрес как MTProto-DC (resPQ на req_pq_multi)."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, 443), timeout=timeout)
+    except Exception:
+        return False
+    try:
+        body = struct.pack('<I', 0xbe7e8ef1) + os.urandom(16)
+        msg_id = int(time.time() * (2 ** 32)) & ~3
+        writer.write(b'\x00' * 8 + struct.pack('<Q', msg_id) + struct.pack('<I', len(body)) + body)
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(32), timeout=timeout)
+        return len(data) >= 24 and struct.unpack('<I', data[20:24])[0] == 0x05162463
+    except Exception:
+        return False
+    finally:
+        writer.close()
+
+
+async def _serves_telegram_web(ip: str, timeout: float = 4.0) -> bool:
+    """Проверяет, отдаёт ли адрес веб-клиент web.telegram.org."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, 443, ssl=ctx, server_hostname='telegram.org'), timeout=timeout
+        )
+    except Exception:
+        return False
+    try:
+        writer.write(
+            b'GET /k/ HTTP/1.1\r\nHost: web.telegram.org\r\n'
+            b'User-Agent: yt-proxy\r\nConnection: close\r\n\r\n'
+        )
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b'\r\n'), timeout=timeout)
+        return head.startswith(b'HTTP/1.1 200')
+    except Exception:
+        return False
+    finally:
+        writer.close()
+
+
+def cli_scan_telegram() -> int:
+    """`--scan-telegram`: ищет хоть один незаблокированный адрес DC Telegram."""
+    hosts = [str(ip) for net in TELEGRAM_DC_NETS for ip in ipaddress.ip_network(net).hosts()]
+    log.info(f"Сканирую {len(hosts)} адресов подсетей DC Telegram, порт 443...")
+    open_ips = []
+    started = time.time()
+    asyncio.run(_scan_open(hosts, open_ips))
+    log.info(f"Открыто {len(open_ips)} из {len(hosts)} (за {time.time() - started:.1f} с)")
+
+    if not open_ips:
+        log.error("❌ Ни один адрес DC Telegram не отвечает — провайдер блэкхолит")
+        log.error("   подсети 149.154.160.0/20, 91.108.56.0/22 и 194.221.25x.0/24 целиком.")
+        log.info("💡 Пробить это можно только промежуточным узлом (релей/VPN) или IPv6:"
+                 " IPv6-адреса DC обычно не блокируются, прокси их уже умеет.")
+        return 1
+
+    mtproto = [ip for ip in open_ips if asyncio.run(_is_mtproto(ip))]
+    web = [ip for ip in open_ips if asyncio.run(_serves_telegram_web(ip))]
+
+    if mtproto:
+        log.info("✅ MTProto-DC доступны: " + ', '.join(mtproto))
+    if web:
+        log.info("✅ Отдают web.telegram.org: " + ', '.join(web))
+        log.info(f"💡 Пропишите релей: {TELEGRAM_RELAY_ENV}={','.join(web)} python3 proxy.py")
+    if not web:
+        log.warning("⚠️ Открытые адреса не отдают web.telegram.org — для веб-клиента нужен релей или IPv6")
+    return 0 if web else 1
+
+
 def cli_check_telegram() -> int:
     """`--check-telegram`: проверяет доступность релея и DC Telegram."""
     ok = True
@@ -685,6 +789,8 @@ if __name__ == '__main__':
         sys.exit(cli_check_certs())
     if '--check-telegram' in args:
         sys.exit(cli_check_telegram())
+    if '--scan-telegram' in args:
+        sys.exit(cli_scan_telegram())
     if '--regen-certs' in args:
         try:
             ensure_certs(force=True)

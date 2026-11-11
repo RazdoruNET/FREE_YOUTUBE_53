@@ -66,6 +66,7 @@ DPI? Ебанулся какой нахуй DPI это килотонны баб
    python3 proxy.py --check-certs     # только проверка сертификатов, без запуска
    python3 proxy.py --regen-certs     # принудительный перевыпуск (нужно заново импортировать cert.pem!)
    python3 proxy.py --check-telegram  # проверить доступность релея и DC Telegram
+   python3 proxy.py --scan-telegram   # найти хоть один незаблокированный адрес DC Telegram
 
    Директория certs/ добавлена в .gitignore: приватные ключи не попадают в репозиторий.
 
@@ -145,9 +146,11 @@ Server: nginx/1.21.1
 
 Если в логах запущенного Python-скрипта отображается запись 🔀 SNI-Swap Tunnel: youtube.com / web.telegram.org, а команды возвращают ожидаемые заголовки (Server: ESF / Server: nginx/1.21.1) — система полностью готова к работе.
 
-Если Telegram не открывается, а в логах видны строки ⚠️ Апстрим <ip>:443 недоступен, запустите диагностику:
+Если Telegram не открывается, а в логах видны строки ⚠️ Апстрим <ip>:443 недоступен, запустите диагностику.
+Быстрый вариант — проверка известных адресов; полный вариант — скан всех подсетей DC (около 20–30 секунд):
 
 python3 proxy.py --check-telegram
+python3 proxy.py --scan-telegram
 
 Она проверяет доступность релея из YT_PROXY_TELEGRAM_RELAY (или DEFAULT_TELEGRAM_RELAYS), DC-адресов Telegram и DC по IPv6. Если все адреса недоступны, провайдер блэкхолит их по IP — поднимите релей на доступном сервере и укажите его: YT_PROXY_TELEGRAM_RELAY=ip1,ip2 python3 proxy.py
 
