@@ -94,6 +94,16 @@ DC_RELAY = {
     '194.221.250.50': ['194.221.250.51', '194.221.250.52'],
 }
 
+# IPv6-адреса дата-центров Telegram. Их провайдеры обычно не блэкхолят,
+# поэтому при наличии IPv6 Telegram Desktop ходит напрямую (CONNECT [v6]:443).
+TELEGRAM_DC_V6 = [
+    '2001:67c:4e8:f001::a',
+    '2001:67c:4e8:f002::a',
+    '2001:67c:4e8:f003::a',
+    '2001:67c:4e8:f004::a',
+    '2001:b28:f23f:f005::a',
+]
+
 
 def relay_candidates(target_host: str, target_port: int) -> list:
     """Возвращает список candidate (ip, port) для попытки соединения.
@@ -125,14 +135,24 @@ def resolve_ips(host: str) -> list:
     """Возвращает список IP апстрима в порядке попыток.
 
     Telegram-домены идут на релей (их собственные A-записи заблэкхолены),
-    остальные — обычное DNS-разрешение.
+    остальные — DNS-разрешение по обеим семьям: сначала IPv4, затем IPv6
+    (нужен, когда IPv4 заблэкхолен, а IPv6 у провайдера проходит).
     """
     if is_telegram_host(host):
         return telegram_relay_ips()
     try:
-        return [socket.gethostbyname(host)]
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     except Exception:
         return [host]
+    v4, v6 = [], []
+    for family, _, _, _, sockaddr in infos:
+        addr = sockaddr[0]
+        if addr.startswith('::ffff:'):      # IPv4-mapped IPv6 — это тот же IPv4
+            addr = addr[7:]
+        bucket = v4 if family == socket.AF_INET or ':' not in addr else v6
+        if addr not in bucket:
+            bucket.append(addr)
+    return v4 + v6 or [host]
 
 
 def parse_host_port(target: str, default_port: int = 443) -> tuple:
@@ -630,8 +650,19 @@ def cli_check_telegram() -> int:
             log.info(f"✅ DC {ip}:443 доступен")
         else:
             log.warning(f"⚠️ DC {ip}:443 заблэкхолен — нужен рабочий IP того же DC")
+
+    reachable_v6 = [ip for ip in TELEGRAM_DC_V6 if probe_tcp(ip, 443, timeout=2.0)]
+    if reachable_v6:
+        log.info("✅ Telegram DC по IPv6 доступны: " + ', '.join(reachable_v6))
+        ok = True
+    else:
+        log.warning(
+            "⚠️ Telegram DC по IPv6 недоступны — включите IPv6 у провайдера/на роутере, "
+            "это самый надёжный путь без своего сервера"
+        )
+
     if not ok:
-        log.info(f"💡 Укажите доступный релей: {TELEGRAM_RELAY_ENV}=ip1,ip2 python3 proxy.py")
+        log.info(f"💡 Альтернатива — доступный релей: {TELEGRAM_RELAY_ENV}=ip1,ip2 python3 proxy.py")
     return 0 if ok else 1
 
 
