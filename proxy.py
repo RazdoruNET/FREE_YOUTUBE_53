@@ -66,22 +66,22 @@ class HeaderParser:
         return self.buf
 
 
-# Принудиваем связку "хост -> IP" для доменов, чьи нативные A-записи
-# заблэкхолятся оператором (149.154.167.99 / 149.154.166.110).
-# 81.200.113.186 — тот же nginx-веш-хост, но IP не в блэкхоле (SNI DPI
-# пропускает td.ru и google.com).
-# ВАЖНО: сервер принимает ТОЛЬКО SNI google.com / telegram.org — SNI в виде
-# web.telegram.org / www.telegram.org рвёт TLS-хендшейк (таймаут).
-FORCE_IP = {
-    'www.telegram.org': '81.200.113.186',
-    'telegram.org': '81.200.113.186',
-    'td.ru': '81.200.113.186',
-    't.me': '81.200.113.186',
-    't.gd': '81.200.113.186',
-    'tdesktop.com': '81.200.113.186',
-    'relay-chat.adw.team': '81.200.113.186',
-    'panel.adw.team': '81.200.113.186',
-}
+# Релей для Telegram-доменов: их нативные A-записи (149.154.167.99) ISP
+# блэкхолит по IP, поэтому *.telegram.org / t.me / td.ru идут на свой nginx,
+# который отдаёт нужный vhost по заголовку Host.
+# ВАЖНО: релей принимает только SNI telegram.org / google.com — SNI вида
+# web.telegram.org рвёт TLS-хендшейк.
+# Адрес релея можно переопределить без правки кода:
+#   YT_PROXY_TELEGRAM_RELAY=10.0.0.1,10.0.0.2 python3 proxy.py
+DEFAULT_TELEGRAM_RELAYS = ['81.200.113.186']
+TELEGRAM_RELAY_ENV = 'YT_PROXY_TELEGRAM_RELAY'
+
+
+def telegram_relay_ips() -> list:
+    """Список IP релея Telegram из YT_PROXY_TELEGRAM_RELAY (или дефолт)."""
+    raw = os.environ.get(TELEGRAM_RELAY_ENV, '')
+    ips = [item.strip() for item in raw.replace(';', ',').split(',') if item.strip()]
+    return ips or list(DEFAULT_TELEGRAM_RELAYS)
 
 # DC-relay: карта "заблокированный DC IP -> список альтернативных IP того же DC".
 # TG-кешка (Desktop) подключается к MTProto по "сырому" IP:443 — у неё нет SNI,
@@ -109,31 +109,52 @@ def relay_candidates(target_host: str, target_port: int) -> list:
     return [(target_host, target_port)]
 
 
+def is_telegram_host(host: str) -> bool:
+    host = host.lower()
+    return any(host == d or host.endswith('.' + d) for d in TELEGRAM_DOMAINS)
+
+
 def sni_for_host(host: str) -> str:
     """Возвращает SNI-хост для апстрим-подключения исходя из целевого домена.
     Telegram: nginx выбирает vhost по SNI, поэтому нужно прислать telegram.org.
     YouTube: Google Edge игнорирует SNI и роутит по Host — гуглим google.com."""
-    telegram_domains = ('telegram.org', 'td.ru', 't.me', 't.gd', 'tdesktop.com')
-    host = host.lower()
-    for d in telegram_domains:
-        if host == d or host.endswith('.' + d):
-            return 'telegram.org'
-    return UPSTREAM_SNI
+    return 'telegram.org' if is_telegram_host(host) else UPSTREAM_SNI
 
 
-def resolve_ip(host: str) -> str:
-    host = host.lower()
-    if host in FORCE_IP:
-        return FORCE_IP[host]
-    # Суффикс-матчинг: все субдомены (*.telegram.org, *.td.ru, ...) сходим в
-    # принудительно заблэкхол-резолвимся на ту же рабочую связку.
-    for forced_host, forced_ip in FORCE_IP.items():
-        if host.endswith('.' + forced_host):
-            return forced_ip
+def resolve_ips(host: str) -> list:
+    """Возвращает список IP апстрима в порядке попыток.
+
+    Telegram-домены идут на релей (их собственные A-записи заблэкхолены),
+    остальные — обычное DNS-разрешение.
+    """
+    if is_telegram_host(host):
+        return telegram_relay_ips()
     try:
-        return socket.gethostbyname(host)
+        return [socket.gethostbyname(host)]
     except Exception:
-        return host
+        return [host]
+
+
+def parse_host_port(target: str, default_port: int = 443) -> tuple:
+    """Разбирает "host:port" из строки CONNECT, включая "[IPv6]:port"."""
+    target = target.strip()
+    if target.startswith('['):
+        end = target.find(']')
+        if end == -1:
+            return target.strip('[]'), default_port
+        host = target[1:end]
+        port_part = target[end + 1:]
+        if port_part.startswith(':') and port_part[1:].isdigit():
+            return host, int(port_part[1:])
+        return host, default_port
+    if target.count(':') > 1:          # голый IPv6 без порта
+        return target, default_port
+    if ':' in target:
+        host, _, port_part = target.rpartition(':')
+        if port_part.isdigit():
+            return host, int(port_part)
+        return host, default_port
+    return target, default_port
 
 
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -202,16 +223,7 @@ async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.S
             await writer.drain()
             return
 
-        target = parts[1]
-        if ':' in target:
-            target_host, target_port_str = target.split(':', 1)
-            try:
-                target_port = int(target_port_str)
-            except ValueError:
-                target_port = 443
-        else:
-            target_host = target
-            target_port = 443
+        target_host, target_port = parse_host_port(parts[1])
 
         # Вычитываем заголовки CONNECT
         while True:
@@ -292,31 +304,44 @@ async def handle_tls_client(reader: asyncio.StreamReader, writer: asyncio.Stream
                 break
 
         if not request_line or not parser.headers_done:
+            writer.close()
             return
 
         parts = request_line.split(' ')
         if len(parts) < 2:
+            writer.close()
             return
         method, path = parts[0], parts[1]
 
         raw_host = parser.headers.get('host', 'unknown')
-        clean_host = raw_host.split(':')[0]
-        ip = resolve_ip(clean_host)
-
+        clean_host, _ = parse_host_port(raw_host)
         sni = sni_for_host(clean_host)
-        log.info(f'🔀 SNI-Swap Tunnel: {clean_host} -> {ip} (SNI={sni})')
 
         # Подключаемся к апстриму с корректным SNI для vhost-подбора nginx
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        upstream_reader, upstream_writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=sni),
-            timeout=CONNECT_TIMEOUT
-        )
+        upstream_reader = upstream_writer = None
+        last_error = None
+        for ip in resolve_ips(clean_host):
+            log.info(f'🔀 SNI-Swap Tunnel: {clean_host} -> {ip} (SNI={sni})')
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=sni),
+                    timeout=CONNECT_TIMEOUT
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                log.warning(f'⚠️ Апстрим {ip}:443 недоступен: {exc!r}')
+        if upstream_writer is None:
+            log.error(f"❌ Ошибка соединения с апстримом (handle_tls_client): {last_error!r}")
+            writer.close()
+            return
     except Exception as e:
         log.error(f"❌ Ошибка соединения с апстримом (handle_tls_client): {e!r}")
+        writer.close()
         return
 
     # Пересобираем запрос
@@ -581,6 +606,35 @@ async def main():
             proxy_server.serve_forever()
         )
 
+def probe_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def cli_check_telegram() -> int:
+    """`--check-telegram`: проверяет доступность релея и DC Telegram."""
+    ok = True
+    relays = telegram_relay_ips()
+    log.info(f"Релей Telegram ({TELEGRAM_RELAY_ENV}): {', '.join(relays)}")
+    for ip in relays:
+        if probe_tcp(ip, 443):
+            log.info(f"✅ релей {ip}:443 доступен")
+        else:
+            ok = False
+            log.error(f"❌ релей {ip}:443 недоступен — Telegram-домены работать не будут")
+    for ip in sorted(DC_RELAY):
+        if probe_tcp(ip, 443):
+            log.info(f"✅ DC {ip}:443 доступен")
+        else:
+            log.warning(f"⚠️ DC {ip}:443 заблэкхолен — нужен рабочий IP того же DC")
+    if not ok:
+        log.info(f"💡 Укажите доступный релей: {TELEGRAM_RELAY_ENV}=ip1,ip2 python3 proxy.py")
+    return 0 if ok else 1
+
+
 def cli_check_certs() -> int:
     """`--check-certs`: только проверка сертификатов, без запуска прокси."""
     errors, warnings = inspect_certs()
@@ -598,6 +652,8 @@ if __name__ == '__main__':
     args = sys.argv[1:]
     if '--check-certs' in args:
         sys.exit(cli_check_certs())
+    if '--check-telegram' in args:
+        sys.exit(cli_check_telegram())
     if '--regen-certs' in args:
         try:
             ensure_certs(force=True)
