@@ -7,9 +7,11 @@ Listens on 127.0.0.1:8443, routes through internal TLS on 127.0.0.1:8444.
 import asyncio
 import ssl
 import os
+import re
 import logging
 import sys
 import socket
+import subprocess
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,6 +26,16 @@ PROXY_PORT = 8443        # Порт для настроек браузера/cur
 INTERNAL_TLS_PORT = 8444 # Внутренний порт для безопасного хендшейка
 UPSTREAM_SNI = 'google.com'
 CONNECT_TIMEOUT = 10
+
+CA_KEY_FILE = 'ca.key'
+CA_CERT_FILE = 'ca.pem'
+SERVER_KEY_FILE = 'key.pem'
+SERVER_CERT_FILE = 'cert.pem'
+CSR_FILE = 'leaf.csr'
+OPENSSL_CONF_FILE = 'openssl.cnf'
+CERT_VALID_DAYS = 3650
+EXPIRY_WARN_SECONDS = 30 * 24 * 60 * 60
+OPENSSL_TIMEOUT = 60
 
 class HeaderParser:
     def __init__(self):
@@ -137,33 +149,39 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         pass
     finally:
         writer.close()
+YOUTUBE_DOMAINS = [
+    'youtube.com',
+    'googlevideo.com',
+    'ytimg.com',
+    'ggpht.com',
+    'youtu.be',
+    'youtube-nocookie.com',
+    'youtubeeducation.com',
+    'yt.be',
+    'youtube.googleapis.com',
+]
+# Telegram: основной сайт живёт на том же nginx-хосте td.ru
+# (81.200.113.186), SNI DPI резал именно telegram.org.
+TELEGRAM_DOMAINS = [
+    'telegram.org',
+    'td.ru',
+    't.me',
+    't.gd',
+    'tdesktop.com',
+    'relay-chat.adw.team',
+    'panel.adw.team',
+]
+MITM_DOMAINS = YOUTUBE_DOMAINS + TELEGRAM_DOMAINS
+
+# Apex-домены CDN, к которым браузер не обращается напрямую (только поддомены):
+# их отсутствие в SAN не считается проблемой.
+APEX_SAN_EXEMPT = {'ytimg.com', 'ggpht.com'}
+
+
 def is_mitm_host(host: str) -> bool:
     """Проверяет, относится ли хост к доменам MITM (YouTube/Telegram и т.д.)."""
     host = host.lower()
-
-    youtube_domains = [
-        'youtube.com',
-        'googlevideo.com',
-        'ytimg.com',
-        'ggpht.com',
-        'youtu.be',
-        'youtube-nocookie.com',
-        'youtubeeducation.com',
-        'yt.be',
-        'youtube.googleapis.com'
-    ]
-    # Telegram: основной сайт живёт на том же nginx-хосте td.ru
-    # (81.200.113.186), SNI DPI резал именно telegram.org.
-    telegram_domains = [
-        'telegram.org',
-        'td.ru',
-        't.me',
-        't.gd',
-        'tdesktop.com',
-        'relay-chat.adw.team',
-        'panel.adw.team',
-    ]
-    for domain in youtube_domains + telegram_domains:
+    for domain in MITM_DOMAINS:
         if host == domain or host.endswith('.' + domain):
             return True
     return False
@@ -330,12 +348,213 @@ async def handle_tls_client(reader: asyncio.StreamReader, writer: asyncio.Stream
         upstream_writer.close()
 
 
+class CertError(RuntimeError):
+    """Ошибка генерации/проверки локальных сертификатов."""
+
+
+def cert_path(name: str) -> str:
+    return os.path.join(CERTS_DIR, name)
+
+
+def san_names() -> list:
+    """SAN для сертификата прокси: каждый домен MITM + wildcard на поддомены."""
+    names = []
+    for domain in MITM_DOMAINS:
+        for name in (domain, '*.' + domain):
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def _openssl_config() -> str:
+    alt_names = '\n'.join(
+        f'DNS.{i} = {name}' for i, name in enumerate(san_names(), 1)
+    )
+    return f"""\
+[ req ]
+distinguished_name = dn
+prompt             = no
+
+[ dn ]
+CN = YT-Proxy
+
+[ v3_req ]
+basicConstraints = critical, CA:FALSE
+keyUsage         = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName   = @alt_names
+
+[ alt_names ]
+{alt_names}
+
+[ v3_ca ]
+basicConstraints     = critical, CA:TRUE
+keyUsage             = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+"""
+
+
+def _openssl(args: list, check: bool = True) -> subprocess.CompletedProcess:
+    try:
+        res = subprocess.run(
+            ['openssl', *args],
+            capture_output=True,
+            text=True,
+            timeout=OPENSSL_TIMEOUT,
+        )
+    except FileNotFoundError:
+        raise CertError("openssl не найден в PATH — установите OpenSSL и повторите запуск")
+    except subprocess.TimeoutExpired:
+        raise CertError(f"openssl не ответил за {OPENSSL_TIMEOUT} с")
+    if check and res.returncode != 0:
+        details = (res.stderr or res.stdout or '').strip().splitlines()
+        reason = details[-1] if details else 'неизвестная ошибка'
+        raise CertError(f"openssl {args[0]}: {reason}")
+    return res
+
+
+def _openssl_text(args: list) -> str:
+    return _openssl(args).stdout
+
+
+def _cert_not_after(cert_file: str) -> str:
+    raw = _openssl_text(['x509', '-in', cert_file, '-noout', '-enddate']).strip()
+    return raw.split('=', 1)[1] if '=' in raw else raw
+
+
+def _cert_sans(cert_file: str) -> list:
+    text = _openssl_text(['x509', '-in', cert_file, '-noout', '-text'])
+    marker = 'Subject Alternative Name'
+    start = text.find(marker)
+    if start == -1:
+        return []
+    block = text[start + len(marker):]
+    end = block.find('X509v3')
+    if end != -1:
+        block = block[:end]
+    return re.findall(r'DNS:([^,\s]+)', block)
+
+
+def _san_covered(name: str, sans: list) -> bool:
+    if name in sans:
+        return True
+    parts = name.split('.')
+    return any('*.' + '.'.join(parts[i:]) in sans for i in range(1, len(parts)))
+
+
+def generate_certs() -> None:
+    """Создаёт локальный CA и листовой сертификат со всеми SAN доменов MITM."""
+    os.makedirs(CERTS_DIR, exist_ok=True)
+    conf_file = cert_path(OPENSSL_CONF_FILE)
+    with open(conf_file, 'w', encoding='utf-8') as fh:
+        fh.write(_openssl_config())
+
+    ca_key, ca_cert = cert_path(CA_KEY_FILE), cert_path(CA_CERT_FILE)
+    srv_key = cert_path(SERVER_KEY_FILE)
+    srv_csr, srv_cert = cert_path(CSR_FILE), cert_path(SERVER_CERT_FILE)
+    days = str(CERT_VALID_DAYS)
+
+    log.info("🔐 Генерация локального УЦ (certs/ca.pem)...")
+    _openssl(['genrsa', '-out', ca_key, '2048'])
+    _openssl([
+        'req', '-x509', '-new', '-key', ca_key, '-sha256', '-days', days,
+        '-out', ca_cert, '-subj', '/CN=YT-Proxy-CA',
+        '-config', conf_file, '-extensions', 'v3_ca',
+    ])
+
+    log.info("🔐 Генерация сертификата прокси (certs/cert.pem)...")
+    _openssl([
+        'req', '-new', '-nodes', '-newkey', 'rsa:2048',
+        '-keyout', srv_key, '-out', srv_csr, '-subj', '/CN=YT-Proxy',
+        '-config', conf_file,
+    ])
+    _openssl([
+        'x509', '-req', '-in', srv_csr, '-CA', ca_cert, '-CAkey', ca_key,
+        '-CAcreateserial', '-sha256', '-days', days, '-out', srv_cert,
+        '-extfile', conf_file, '-extensions', 'v3_req',
+    ])
+
+    for path in (ca_key, srv_key):
+        os.chmod(path, 0o600)
+    log.info(f"✅ Сертификаты созданы в {CERTS_DIR}")
+
+
+def inspect_certs() -> tuple:
+    """Проверяет сертификаты. Возвращает (ошибки, предупреждения)."""
+    errors, warnings = [], []
+    srv_cert, srv_key = cert_path(SERVER_CERT_FILE), cert_path(SERVER_KEY_FILE)
+    ca_cert, ca_key = cert_path(CA_CERT_FILE), cert_path(CA_KEY_FILE)
+
+    for path in (srv_cert, srv_key):
+        if not os.path.exists(path):
+            errors.append(f"нет файла {os.path.basename(path)}")
+    if errors:
+        return errors, warnings
+
+    try:
+        if _openssl(['x509', '-in', srv_cert, '-noout', '-checkend', '0'], check=False).returncode != 0:
+            errors.append("срок действия cert.pem истёк")
+        elif _openssl(
+            ['x509', '-in', srv_cert, '-noout', '-checkend', str(EXPIRY_WARN_SECONDS)],
+            check=False,
+        ).returncode != 0:
+            warnings.append(f"cert.pem истекает {_cert_not_after(srv_cert)}")
+
+        cert_pub = _openssl_text(['x509', '-in', srv_cert, '-noout', '-pubkey']).strip()
+        key_pub = _openssl_text(['rsa', '-in', srv_key, '-pubout']).strip()
+        if cert_pub != key_pub:
+            errors.append("key.pem не соответствует cert.pem")
+
+        sans = _cert_sans(srv_cert)
+        missing = [
+            name for name in san_names()
+            if name not in APEX_SAN_EXEMPT and not _san_covered(name, sans)
+        ]
+        if missing:
+            shown = ', '.join(missing[:5]) + (' ...' if len(missing) > 5 else '')
+            warnings.append(f"в cert.pem нет SAN: {shown} (пересоздайте: --regen-certs)")
+    except CertError as exc:
+        errors.append(str(exc))
+        return errors, warnings
+
+    if not (os.path.exists(ca_cert) and os.path.exists(ca_key)):
+        warnings.append("нет ca.pem/ca.key — сертификат нельзя продлить без перевыпуска")
+
+    return errors, warnings
+
+
+def ensure_certs(force: bool = False) -> None:
+    """Проверяет сертификаты и создаёт их, если файлов нет или они невалидны."""
+    if not force:
+        errors, warnings = inspect_certs()
+        for warning in warnings:
+            log.warning(f"⚠️ Сертификаты: {warning}")
+        if not errors:
+            log.info(
+                f"🔐 Сертификаты в порядке, действуют до {_cert_not_after(cert_path(SERVER_CERT_FILE))}"
+            )
+            return
+        log.warning("⚠️ Проблемы с сертификатами: " + '; '.join(errors))
+    else:
+        log.info("🔐 Принудительный перевыпуск сертификатов (--regen-certs)")
+
+    generate_certs()
+    errors, warnings = inspect_certs()
+    for warning in warnings:
+        log.warning(f"⚠️ Сертификаты: {warning}")
+    if errors:
+        raise CertError("сертификаты не прошли проверку после генерации: " + '; '.join(errors))
+
+
 async def main():
-    cert_file = os.path.join(CERTS_DIR, 'cert.pem')
-    key_file = os.path.join(CERTS_DIR, 'key.pem')
-    if not os.path.exists(cert_file) or not os.path.exists(key_file):
-        log.critical(f"Сертификаты не найдены в {CERTS_DIR}!")
-        return
+    try:
+        ensure_certs()
+    except CertError as exc:
+        log.critical(f"❌ {exc}")
+        return 1
+
+    cert_file = cert_path(SERVER_CERT_FILE)
+    key_file = cert_path(SERVER_KEY_FILE)
 
     # 1. Настраиваем официальный стабильный TLS контекст для внутреннего порта
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -362,8 +581,34 @@ async def main():
             proxy_server.serve_forever()
         )
 
+def cli_check_certs() -> int:
+    """`--check-certs`: только проверка сертификатов, без запуска прокси."""
+    errors, warnings = inspect_certs()
+    for warning in warnings:
+        log.warning(f"⚠️ Сертификаты: {warning}")
+    if errors:
+        for error in errors:
+            log.error(f"❌ {error}")
+        return 1
+    log.info(f"✅ Сертификаты в порядке, действуют до {_cert_not_after(cert_path(SERVER_CERT_FILE))}")
+    return 0
+
+
 if __name__ == '__main__':
+    args = sys.argv[1:]
+    if '--check-certs' in args:
+        sys.exit(cli_check_certs())
+    if '--regen-certs' in args:
+        try:
+            ensure_certs(force=True)
+        except CertError as exc:
+            log.critical(f"❌ {exc}")
+            sys.exit(1)
+        sys.exit(0)
+
     try:
-        asyncio.run(main())
+        exit_code = asyncio.run(main())
     except KeyboardInterrupt:
         log.info("Прокси остановлен.")
+        exit_code = 0
+    sys.exit(exit_code or 0)
