@@ -179,7 +179,7 @@ python3 proxy.py --scan-telegram
 
       YT_PROXY_RELAY=10.88.0.1:8443 YT_PROXY_RELAY_AUTH=user:pass python3 proxy.py
 
-  Через релей идут только домены из `YT_PROXY_RELAY_DOMAINS` (по умолчанию Instagram, TikTok и их CDN), остальной трафик — напрямую. Если релей не ответил, прокси пробует прямое подключение.
+  Через релей идут только домены из `YT_PROXY_RELAY_DOMAINS` (по умолчанию Instagram, TikTok и их CDN), остальной трафик — напрямую. Список стоит сузить, если через релей сервис недоступен, а напрямую — работает: например, TikTok блокирует IP релея, но пускает узел. Если релей не ответил, прокси пробует прямое подключение.
 
   Релей можно запереть с его стороны: `YT_PROXY_AUTH=user:pass` требует `Proxy-Authorization` (без него — 407), `YT_PROXY_CONNECT_ALLOW=instagram.com,...` разрешает туннели только к перечисленным доменам (иначе — 403), а `YT_PROXY_NO_MITM=1` полностью выключает перехват TLS — релею он не нужен. Пара к `YT_PROXY_AUTH` на клиенте — `YT_PROXY_RELAY_AUTH`.
 
