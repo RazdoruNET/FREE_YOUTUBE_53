@@ -6,6 +6,7 @@ Listens on 127.0.0.1:8443, routes through internal TLS on 127.0.0.1:8444.
 
 import asyncio
 import base64
+import hmac
 import ipaddress
 import json
 import ssl
@@ -60,6 +61,15 @@ DNS_CACHE_TTL = 120
 RELAY_ENV = 'YT_PROXY_RELAY'
 RELAY_DOMAINS_ENV = 'YT_PROXY_RELAY_DOMAINS'
 RELAY_AUTH_ENV = 'YT_PROXY_RELAY_AUTH'
+
+# Настройки самого релея (серверная сторона). Если YT_PROXY_AUTH задан,
+# CONNECT без верного Proxy-Authorization отклоняется (407). Если задан
+# YT_PROXY_CONNECT_ALLOW — прокси открывает туннели только к этим доменам,
+# остальное получает 403. Нужно, чтобы выставленный в туннель прокси нельзя
+# было использовать как общий выход в интернет.
+AUTH_ENV = 'YT_PROXY_AUTH'
+CONNECT_ALLOW_ENV = 'YT_PROXY_CONNECT_ALLOW'
+NO_MITM_ENV = 'YT_PROXY_NO_MITM'
 
 # Резервные адреса для доменов, у которых провайдер блэкхолит DNS-ответ, но
 # другие адреса того же сервиса открыты (у Meta это обычная картина: 31.13.x
@@ -484,7 +494,39 @@ def relay_auth_header() -> str:
     if not raw:
         return ''
 
-    return 'Basic ' + base64.b64encode(raw.encode('utf-8')).decode('ascii')
+    return basic_auth_header(raw)
+
+
+def basic_auth_header(credentials: str) -> str:
+    value = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
+    return f'Basic {value}'
+
+
+def mitm_enabled() -> bool:
+    """MITM можно выключить (YT_PROXY_NO_MITM=1): релею он не нужен вовсе."""
+    return not env_flag(NO_MITM_ENV, False)
+
+
+def connect_authorized(header: str) -> bool:
+    """Проверяет Proxy-Authorization, если на этом прокси задан YT_PROXY_AUTH."""
+    expected = os.environ.get(AUTH_ENV, '').strip()
+
+    if not expected:
+        return True
+
+    return hmac.compare_digest(header.strip(), basic_auth_header(expected))
+
+
+def connect_target_allowed(host: str) -> bool:
+    """Белый список целей CONNECT (YT_PROXY_CONNECT_ALLOW), если он задан."""
+    raw = os.environ.get(CONNECT_ALLOW_ENV, '').strip()
+
+    if not raw:
+        return True
+
+    domains = [item.strip().lower() for item in raw.replace(';', ',').split(',') if item.strip()]
+
+    return host_in(host, domains)
 
 
 def extra_ips(host: str) -> list:
@@ -669,13 +711,33 @@ async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.S
 
         target_host, target_port = parse_host_port(parts[1])
 
-        # Вычитываем заголовки CONNECT
+        # Вычитываем заголовки CONNECT: нужен Proxy-Authorization для релея.
+        proxy_auth = ''
         while True:
             header_line = await reader.readuntil(b'\r\n')
             if header_line == b'\r\n':
                 break
+            name, _, value = header_line.decode('latin-1').partition(':')
+            if name.strip().lower() == 'proxy-authorization':
+                proxy_auth = value.strip()
 
-        is_mitm = is_mitm_host(target_host)
+        if not connect_authorized(proxy_auth):
+            log.warning(f"🔒 CONNECT без верного пароля: {target_host}:{target_port}")
+            writer.write(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                b'Proxy-Authenticate: Basic realm="yt-proxy"\r\n'
+                b"Content-Length: 0\r\n\r\n"
+            )
+            await writer.drain()
+            return
+
+        if not connect_target_allowed(target_host):
+            log.warning(f"🚫 CONNECT в обход белого списка: {target_host}:{target_port}")
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        is_mitm = mitm_enabled() and is_mitm_host(target_host)
 
         if is_mitm:
             log.info(f"🎯 Направление трафика на MITM (внутренний TLS): {target_host}:{target_port}")
@@ -1002,32 +1064,42 @@ def ensure_certs(force: bool = False) -> None:
 
 
 async def main():
-    try:
-        ensure_certs()
-    except CertError as exc:
-        log.critical(f"❌ {exc}")
-        return 1
+    tls_server = None
 
-    cert_file = cert_path(SERVER_CERT_FILE)
-    key_file = cert_path(SERVER_KEY_FILE)
+    if mitm_enabled():
+        try:
+            ensure_certs()
+        except CertError as exc:
+            log.critical(f"❌ {exc}")
+            return 1
 
-    # 1. Настраиваем официальный стабильный TLS контекст для внутреннего порта
-    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
-    ssl_ctx.set_alpn_protocols(['http/1.1'])
+        cert_file = cert_path(SERVER_CERT_FILE)
+        key_file = cert_path(SERVER_KEY_FILE)
 
-    # 2. Запускаем внутренний TLS сервер
-    tls_server = await asyncio.start_server(
-        handle_tls_client, LISTEN_HOST, INTERNAL_TLS_PORT, ssl=ssl_ctx
-    )
-    
+        # 1. Настраиваем официальный стабильный TLS контекст для внутреннего порта
+        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+        ssl_ctx.set_alpn_protocols(['http/1.1'])
+
+        # 2. Запускаем внутренний TLS сервер
+        tls_server = await asyncio.start_server(
+            handle_tls_client, LISTEN_HOST, INTERNAL_TLS_PORT, ssl=ssl_ctx
+        )
+
     # 3. Запускаем внешний CONNECT прокси сервер
     proxy_server = await asyncio.start_server(
         handle_connect_request, LISTEN_HOST, PROXY_PORT
     )
-    
+
     log.info(f"🚀 Прокси успешно запущен!")
     log.info(f"   -> Внешний порт для браузера: {LISTEN_HOST}:{PROXY_PORT}")
+
+    if tls_server is None:
+        log.info("   -> MITM выключен (YT_PROXY_NO_MITM=1): только CONNECT-туннели")
+        async with proxy_server:
+            await proxy_server.serve_forever()
+        return 0
+
     log.info(f"   -> Внутренний TLS обработчик: {LISTEN_HOST}:{INTERNAL_TLS_PORT}")
 
     async with tls_server, proxy_server:
@@ -1035,6 +1107,9 @@ async def main():
             tls_server.serve_forever(),
             proxy_server.serve_forever()
         )
+
+    return 0
+
 
 def probe_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
     try:
