@@ -5,7 +5,9 @@ Listens on 127.0.0.1:8443, routes through internal TLS on 127.0.0.1:8444.
 """
 
 import asyncio
+import base64
 import ipaddress
+import json
 import ssl
 import os
 import re
@@ -15,6 +17,8 @@ import sys
 import socket
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +33,30 @@ PROXY_PORT = 8443        # Порт для настроек браузера/cur
 INTERNAL_TLS_PORT = 8444 # Внутренний порт для безопасного хендшейка
 UPSTREAM_SNI = 'google.com'
 CONNECT_TIMEOUT = 10
+# Предел на одну попытку подключения к конкретному адресу: блокированные IP
+# просто не отвечают, и ждать полный CONNECT_TIMEOUT на каждом — слишком долго.
+CONNECT_ATTEMPT_TIMEOUT = 4
+# Сколько раз перебираем список адресов. Блокировка у российских провайдеров
+# «дырявая»: часть SYN проходит, часть теряется, поэтому вторая попытка
+# заметно повышает шансы.
+CONNECT_ROUNDS = 2
+
+# DNS по HTTPS. Провайдеры подменяют A-записи Instagram на 127.0.0.1 (на живом
+# домашнем подключении это воспроизводится), и тогда CONNECT уходит в локальный
+# порт вместо Meta. Системный DNS даёт непригодные адреса — переспрашиваем у DoH.
+DOH_ENDPOINTS = (
+    'https://cloudflare-dns.com/dns-query',
+    'https://dns.google/resolve',
+)
+DOH_TIMEOUT = 6
+DNS_CACHE_TTL = 120
+
+# Релей — обычный HTTP-прокси на хосте, которому сервис доступен (например,
+# второй сервер за WireGuard). Через него идут только домены из списка ниже,
+# поэтому весь остальной трафик релею не доверяется.
+RELAY_ENV = 'YT_PROXY_RELAY'
+RELAY_DOMAINS_ENV = 'YT_PROXY_RELAY_DOMAINS'
+RELAY_AUTH_ENV = 'YT_PROXY_RELAY_AUTH'
 
 CA_KEY_FILE = 'ca.key'
 CA_CERT_FILE = 'ca.pem'
@@ -141,24 +169,59 @@ def is_telegram_host(host: str) -> bool:
 def sni_for_host(host: str) -> str:
     """Возвращает SNI-хост для апстрим-подключения исходя из целевого домена.
     Telegram: nginx выбирает vhost по SNI, поэтому нужно прислать telegram.org.
-    YouTube: Google Edge игнорирует SNI и роутит по Host — гуглим google.com."""
-    return 'telegram.org' if is_telegram_host(host) else UPSTREAM_SNI
-
-
-def resolve_ips(host: str) -> list:
-    """Возвращает список IP апстрима в порядке попыток.
-
-    Telegram-домены идут на релей (их собственные A-записи заблэкхолены),
-    остальные — DNS-разрешение по обеим семьям: сначала IPv4, затем IPv6
-    (нужен, когда IPv4 заблэкхолен, а IPv6 у провайдера проходит).
-    """
+    YouTube: Google Edge игнорирует SNI и роутит по Host — гуглим google.com.
+    Всё остальное (если попадёт в MITM) требует настоящего SNI: фронты вроде
+    Meta Edge выбирают сайт именно по нему."""
     if is_telegram_host(host):
-        return telegram_relay_ips()
+        return 'telegram.org'
+
+    if host_in(host, YOUTUBE_DOMAINS):
+        return UPSTREAM_SNI
+
+    return host
+
+
+_dns_cache = {}
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip('[]'))
+        return True
+    except ValueError:
+        return False
+
+
+def _usable_ips(ips: list) -> list:
+    """Оставляет адреса, по которым действительно можно идти к чужому сервису."""
+    usable = []
+
+    for raw in ips:
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            continue
+
+        # Петля, «некуда» и link-local — это не апстрим, а наша же машина.
+        # Отравленная DNS-запись (127.0.0.1) иначе превратила бы прокси
+        # в мост к локальным службам.
+        if addr.is_loopback or addr.is_unspecified or addr.is_link_local or addr.is_multicast:
+            continue
+
+        if raw not in usable:
+            usable.append(raw)
+
+    return usable
+
+
+def _system_resolve(host: str) -> list:
     try:
         infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     except Exception:
-        return [host]
+        return []
+
     v4, v6 = [], []
+
     for family, _, _, _, sockaddr in infos:
         addr = sockaddr[0]
         if addr.startswith('::ffff:'):      # IPv4-mapped IPv6 — это тот же IPv4
@@ -166,7 +229,103 @@ def resolve_ips(host: str) -> list:
         bucket = v4 if family == socket.AF_INET or ':' not in addr else v6
         if addr not in bucket:
             bucket.append(addr)
-    return v4 + v6 or [host]
+
+    return v4 + v6
+
+
+def _doh_query(endpoint: str, host: str, rtype: str) -> list:
+    query = urllib.parse.urlencode({'name': host, 'type': rtype})
+    request = urllib.request.Request(
+        f'{endpoint}?{query}',
+        headers={'Accept': 'application/dns-json'},
+    )
+
+    with urllib.request.urlopen(request, timeout=DOH_TIMEOUT) as response:
+        payload = json.loads(response.read().decode('utf-8'))
+
+    return [
+        str(answer.get('data', '')).strip()
+        for answer in payload.get('Answer') or []
+        if answer.get('type') in (1, 28) and answer.get('data')
+    ]
+
+
+def _doh_resolve(host: str) -> list:
+    """Спрашивает A/AAAA у DoH-резолверов, пока один из них не ответит."""
+    for endpoint in DOH_ENDPOINTS:
+        try:
+            ips = _doh_query(endpoint, host, 'A') + _doh_query(endpoint, host, 'AAAA')
+        except Exception as exc:
+            log.debug(f'DoH {endpoint} не ответил для {host}: {exc!r}')
+            continue
+
+        if ips:
+            return ips
+
+    return []
+
+
+def _cache_get(host: str):
+    item = _dns_cache.get(host)
+
+    if not item:
+        return None
+
+    stamp, ips = item
+
+    if time.time() - stamp > DNS_CACHE_TTL:
+        _dns_cache.pop(host, None)
+        return None
+
+    return list(ips)
+
+
+def _cache_put(host: str, ips: list) -> None:
+    if len(_dns_cache) > 512:
+        _dns_cache.clear()
+
+    _dns_cache[host] = (time.time(), list(ips))
+
+
+async def resolve_ips(host: str) -> list:
+    """Возвращает адреса апстрима в порядке попыток.
+
+    Telegram-домены идут на релей (их собственные A-записи заблэкхолены).
+    Остальные разрешаются штатно (IPv4, затем IPv6 — нужен, когда IPv4
+    заблэкхолен). Если системный DNS отдал только петлю или пустоту,
+    переспрашиваем по HTTPS: так обходится подмена записей Instagram у
+    провайдера. YT_PROXY_DOH_FIRST=1 — всегда начинать с DoH.
+    """
+    if _is_ip_literal(host):
+        return [host.strip('[]')]
+
+    if is_telegram_host(host):
+        return telegram_relay_ips()
+
+    cached = _cache_get(host)
+
+    if cached is not None:
+        return cached
+
+    doh_first = env_flag('YT_PROXY_DOH_FIRST', False)
+    system = _usable_ips(_system_resolve(host))
+    doh = []
+
+    if env_flag('YT_PROXY_DOH', True) and (doh_first or not system):
+        doh = _usable_ips(await asyncio.to_thread(_doh_resolve, host))
+
+        if doh:
+            log.info(f'🌐 DNS по HTTPS для {host}: {", ".join(doh)}')
+
+    if doh_first and doh:
+        ips = doh
+    else:
+        ips = system + [ip for ip in doh if ip not in system]
+
+    ips = ips or [host]
+    _cache_put(host, ips)
+
+    return ips
 
 
 def parse_host_port(target: str, default_port: int = 443) -> tuple:
@@ -226,6 +385,29 @@ TELEGRAM_DOMAINS = [
     'relay-chat.adw.team',
     'panel.adw.team',
 ]
+# Instagram и TikTok: их фронты (Meta Edge, Akamai/TikTok) выбирают сайт по SNI
+# и, в отличие от Google Edge, его не игнорируют. Подменить SNI на google.com
+# нельзя — такой сайт на этом фронте не обслуживается. Поэтому домены идут
+# обычным туннелем, а их настоящие проблемы решаются иначе:
+#   • DNS по HTTPS — провайдер подменяет instagram.com на 127.0.0.1;
+#   • перебор всех адресов — часть IP Meta заблэкхолена;
+#   • релей (YT_PROXY_RELAY) — когда недоступны сами адреса.
+INSTAGRAM_DOMAINS = [
+    'instagram.com',
+    'cdninstagram.com',   # scontent*.cdninstagram.com — фото и видео
+    'fbcdn.net',          # CNAME медиа Instagram
+]
+TIKTOK_DOMAINS = [
+    'tiktok.com',
+    'tiktokv.com',        # api*.tiktokv.com — API приложения
+    'tiktokcdn.com',      # медиа
+    'tiktokcdn-us.com',
+    'tiktokv.us',
+    'ttwstatic.com',      # статика веб-клиента
+    'ibytedtos.com',
+    'byteoversea.com',
+]
+SOCIAL_DOMAINS = INSTAGRAM_DOMAINS + TIKTOK_DOMAINS
 MITM_DOMAINS = YOUTUBE_DOMAINS + TELEGRAM_DOMAINS
 
 # Apex-домены CDN, к которым браузер не обращается напрямую (только поддомены):
@@ -240,6 +422,133 @@ def is_mitm_host(host: str) -> bool:
         if host == domain or host.endswith('.' + domain):
             return True
     return False
+
+
+def env_flag(name: str, default: bool) -> bool:
+    """Флаг из окружения: пусто — default, иначе 0/1, true/false, yes/no, on/off."""
+    raw = os.environ.get(name, '').strip().lower()
+
+    if not raw:
+        return default
+
+    return raw in ('1', 'true', 'yes', 'on', 'да')
+
+
+def host_in(host: str, domains) -> bool:
+    """Домен совпадает сам или является поддоменом одного из списка."""
+    host = host.lower().rstrip('.')
+
+    return any(host == domain or host.endswith('.' + domain) for domain in domains)
+
+
+def relay_endpoint() -> tuple:
+    """Адрес релея (host, port) из YT_PROXY_RELAY или None."""
+    raw = os.environ.get(RELAY_ENV, '').strip()
+
+    if not raw:
+        return None
+
+    return parse_host_port(raw, 8443)
+
+
+def relay_domains() -> list:
+    """Домены, которые уходят через релей: YT_PROXY_RELAY_DOMAINS или Instagram+TikTok."""
+    raw = os.environ.get(RELAY_DOMAINS_ENV, '').strip()
+
+    if not raw:
+        return list(SOCIAL_DOMAINS)
+
+    return [item.strip().lower() for item in raw.replace(';', ',').split(',') if item.strip()]
+
+
+def relay_auth_header() -> str:
+    """Заголовок Proxy-Authorization для релея: YT_PROXY_RELAY_AUTH=user:pass."""
+    raw = os.environ.get(RELAY_AUTH_ENV, '').strip()
+
+    if not raw:
+        return ''
+
+    return 'Basic ' + base64.b64encode(raw.encode('utf-8')).decode('ascii')
+
+
+async def open_via_relay(relay: tuple, host: str, port: int):
+    """Просит релей открыть CONNECT к цели и возвращает готовый туннель."""
+    relay_host, relay_port = relay
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(relay_host, relay_port), timeout=CONNECT_TIMEOUT
+    )
+
+    try:
+        lines = [f'CONNECT {host}:{port} HTTP/1.1', f'Host: {host}:{port}']
+        auth = relay_auth_header()
+
+        if auth:
+            lines.append(f'Proxy-Authorization: {auth}')
+
+        writer.write(('\r\n'.join(lines) + '\r\n\r\n').encode('latin-1'))
+        await writer.drain()
+
+        # Читаем весь блок заголовков: если оставить хвост в буфере, он уйдёт
+        # клиенту как начало ответа целевого сайта и сломает поток.
+        response = await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), timeout=CONNECT_TIMEOUT)
+        status = response.split(b'\r\n', 1)[0].decode('latin-1')
+
+        if not status.startswith('HTTP/1.') or b' 200' not in response.split(b'\r\n', 1)[0] + b' ':
+            raise ConnectionError(f'релей ответил: {status}')
+
+        return reader, writer
+    except Exception:
+        writer.close()
+        raise
+
+
+async def open_direct(host: str, port: int):
+    """Открывает TCP к цели, перебирая адреса и повторяя заход при обрыве."""
+    if host.lower() in DC_RELAY:
+        candidates = relay_candidates(host, port)
+    else:
+        candidates = [(ip, port) for ip in await resolve_ips(host)]
+
+    last_error = None
+
+    for round_no in range(1, CONNECT_ROUNDS + 1):
+        for ip, candidate_port in candidates:
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, candidate_port),
+                    timeout=CONNECT_ATTEMPT_TIMEOUT,
+                )
+            except Exception as exc:
+                last_error = exc
+                log.warning(f'⚠️ Апстрим {ip}:{candidate_port} недоступен: {exc!r}')
+                continue
+
+            if round_no > 1 or len(candidates) > 1:
+                log.info(f'✅ Соединение установлено: {host} -> {ip}:{candidate_port}')
+            return upstream_reader, upstream_writer
+
+        if round_no < CONNECT_ROUNDS:
+            # Пауза между кругами: блокировка «дырявая», повтор часто проходит.
+            await asyncio.sleep(0.5)
+
+    raise ConnectionError(f'все адреса {host}:{port} недоступны ({last_error!r})')
+
+
+async def open_tunnel(host: str, port: int):
+    """Туннель к цели: через релей, если он настроен для этого домена, иначе напрямую."""
+    relay = relay_endpoint()
+
+    if relay and host_in(host, relay_domains()):
+        try:
+            log.info(f'🛰️ Через релей {relay[0]}:{relay[1]}: {host}:{port}')
+            return await open_via_relay(relay, host, port)
+        except Exception as exc:
+            log.warning(f'⚠️ Релей не открыл {host}:{port}: {exc!r}')
+            log.info('↩️ Пробуем напрямую')
+
+    return await open_direct(host, port)
+
+
 async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Принимает CONNECT от браузера. Если запрос идет к YouTube, перенаправляет поток на внутренний TLS лисенер (MITM). Иначе идет напрямую к хосту."""
     try:
@@ -277,28 +586,14 @@ async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.S
                 await writer.drain()
                 return
         else:
-            candidates = relay_candidates(target_host, target_port)
-            upstream_reader = upstream_writer = None
-            for idx, (ip, port) in enumerate(candidates):
-                if idx > 0:
-                    log.info(f"🔁 DC-relay: пробуем {ip}:{port} (попытка {idx + 1})")
-                else:
-                    log.info(f"🟢 Обход MITM (напрямую): {ip}:{port}")
-                try:
-                    upstream_reader, upstream_writer = await asyncio.wait_for(
-                        asyncio.open_connection(ip, port),
-                        timeout=CONNECT_TIMEOUT
-                    )
-                    if idx > 0:
-                        log.info(f"✅ DC-relay: соединение установлено через {ip}:{port}")
-                    break
-                except Exception as e:
-                    log.warning(f"⚠️ Не удалось подключиться к {ip}:{port}: {e!r}")
-                    if idx == len(candidates) - 1:
-                        log.error(f"❌ Все candidate для {target_host}:{target_port} исчерпаны")
-                        writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                        await writer.drain()
-                        return
+            log.info(f"🟢 Туннель (без MITM): {target_host}:{target_port}")
+            try:
+                upstream_reader, upstream_writer = await open_tunnel(target_host, target_port)
+            except Exception as e:
+                log.error(f"❌ {target_host}:{target_port}: {e}")
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await writer.drain()
+                return
 
         # Сообщаем браузеру, что туннель построен
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -358,12 +653,12 @@ async def handle_tls_client(reader: asyncio.StreamReader, writer: asyncio.Stream
 
         upstream_reader = upstream_writer = None
         last_error = None
-        for ip in resolve_ips(clean_host):
+        for ip in await resolve_ips(clean_host):
             log.info(f'🔀 SNI-Swap Tunnel: {clean_host} -> {ip} (SNI={sni})')
             try:
                 upstream_reader, upstream_writer = await asyncio.wait_for(
                     asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=sni),
-                    timeout=CONNECT_TIMEOUT
+                    timeout=CONNECT_ATTEMPT_TIMEOUT
                 )
                 break
             except Exception as exc:
@@ -770,6 +1065,85 @@ def cli_check_telegram() -> int:
     return 0 if ok else 1
 
 
+SOCIAL_CHECKS = {
+    'instagram': (
+        ('www.instagram.com', '/'),
+        ('scontent.cdninstagram.com', '/'),
+    ),
+    'tiktok': (
+        ('www.tiktok.com', '/'),
+    ),
+}
+
+
+async def _probe_https(host: str, path: str = '/') -> list:
+    """Пробует HTTPS к каждому адресу хоста. Возвращает (адрес, успех, ответ)."""
+    results = []
+    ctx = ssl.create_default_context()
+
+    for ip in await resolve_ips(host):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=host),
+                timeout=CONNECT_ATTEMPT_TIMEOUT,
+            )
+        except Exception as exc:
+            results.append((ip, False, f'нет TLS: {exc!r}'))
+            continue
+
+        try:
+            writer.write((
+                f'GET {path} HTTP/1.1\r\nHost: {host}\r\n'
+                'User-Agent: yt-proxy-check\r\nAccept: */*\r\nConnection: close\r\n\r\n'
+            ).encode('latin-1'))
+            await writer.drain()
+            head = await asyncio.wait_for(reader.readuntil(b'\r\n'), timeout=CONNECT_ATTEMPT_TIMEOUT)
+            status = head.decode('latin-1').strip()
+            parts = status.split(' ')
+            ok = (
+                len(parts) > 1
+                and parts[0].startswith('HTTP/1.')
+                and parts[1][:1] in ('2', '3')
+            )
+            results.append((ip, ok, status))
+        except Exception as exc:
+            results.append((ip, False, f'нет HTTP-ответа: {exc!r}'))
+        finally:
+            writer.close()
+
+    return results
+
+
+def cli_check_social(name: str) -> int:
+    """`--check-instagram` / `--check-tiktok`: DNS, TLS и ответ сервиса по каждому адресу."""
+    relay = relay_endpoint()
+    log.info(
+        f"Проверка {name}: DoH="
+        f"{'вкл' if env_flag('YT_PROXY_DOH', True) else 'выкл'}, "
+        f"релей={relay[0] + ':' + str(relay[1]) if relay else 'нет'}"
+    )
+
+    ok = False
+
+    for host, path in SOCIAL_CHECKS[name]:
+        log.info(f"-- {host}")
+
+        for ip, address_ok, detail in asyncio.run(_probe_https(host, path)):
+            log.info(f"   {ip}: {'✅' if address_ok else '❌'} {detail}")
+            ok = ok or address_ok
+
+    if not ok:
+        log.error(f"❌ {name}: ни один адрес не ответил по HTTPS")
+        log.info(
+            "💡 DNS отдаёт 127.0.0.1 — значит, провайдер подменяет записи; "
+            f"DoH включён по умолчанию. IP не отвечают — нужен релей: {RELAY_ENV}=host:port"
+        )
+        return 1
+
+    log.info(f"✅ {name}: рабочий адрес найден")
+    return 0
+
+
 def cli_check_certs() -> int:
     """`--check-certs`: только проверка сертификатов, без запуска прокси."""
     errors, warnings = inspect_certs()
@@ -789,6 +1163,10 @@ if __name__ == '__main__':
         sys.exit(cli_check_certs())
     if '--check-telegram' in args:
         sys.exit(cli_check_telegram())
+    if '--check-instagram' in args:
+        sys.exit(cli_check_social('instagram'))
+    if '--check-tiktok' in args:
+        sys.exit(cli_check_social('tiktok'))
     if '--scan-telegram' in args:
         sys.exit(cli_scan_telegram())
     if '--regen-certs' in args:

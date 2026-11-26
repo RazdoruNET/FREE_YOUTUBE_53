@@ -82,6 +82,13 @@ async def main():
         if "200 Connection Established" not in resp:
             print(f"❌ Failed for t.me: {resp}", flush=True)
             success = False
+
+        # 7. Instagram и TikTok идут обычным туннелем (без MITM). Доступность
+        # зависит от сети: часть адресов Meta провайдер блэкхолит, поэтому
+        # печатаем результат, но из-за него тест не валим.
+        for social in ("www.instagram.com", "www.tiktok.com"):
+            resp = await test_domain("127.0.0.1", 8443, social, 443)
+            print(f"ℹ️ {social}: {resp} (проверка сети, на итог не влияет)", flush=True)
             
     except Exception as e:
         print(f"❌ Exception occurred during test: {e}", flush=True)
