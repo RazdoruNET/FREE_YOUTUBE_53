@@ -335,20 +335,27 @@ async def resolve_ips(host: str) -> list:
     if cached is not None:
         return cached
 
-    doh_first = env_flag('YT_PROXY_DOH_FIRST', False) or trusted_target
+    force_doh = env_flag('YT_PROXY_DOH_FIRST', False)
     extras = _usable_ips(extra_ips(host))
     system = _usable_ips(_system_resolve(host))
     doh = []
 
-    if env_flag('YT_PROXY_DOH', True) and (doh_first or not system):
+    if env_flag('YT_PROXY_DOH', True) and (force_doh or trusted_target or not system):
         doh = _usable_ips(await asyncio.to_thread(_doh_resolve, host))
 
         if doh:
             log.info(f'🌐 DNS по HTTPS для {host}: {", ".join(doh)}')
 
-    if doh_first and doh:
+    if trusted_target and is_telegram_host(host):
+        # Telegram: системный ответ может указывать на живой, но чужой сервер
+        # (подмена на старый релей), поэтому берём только DoH.
+        resolved = doh or system
+    elif force_doh and doh:
         resolved = doh
     else:
+        # Instagram и остальное: берём оба ответа. Гоночный CONNECT выберет
+        # тот адрес, который действительно отвечает, — разные резолверы Meta
+        # возвращают разные edge-адреса, и часть из них заблэкхолена.
         resolved = system + [ip for ip in doh if ip not in system]
 
     # Резервные адреса идут первыми: они появились не просто так — обычно это
