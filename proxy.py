@@ -40,6 +40,9 @@ CONNECT_ATTEMPT_TIMEOUT = 4
 # «дырявая»: часть SYN проходит, часть теряется, поэтому вторая попытка
 # заметно повышает шансы.
 CONNECT_ROUNDS = 2
+# Сколько адресов пробуем одновременно. У Instagram и TikTok их несколько, и
+# гонка убирает ожидание таймаута на каждом заблэкхоленном адресе.
+CONNECT_RACE_LIMIT = 4
 
 # DNS по HTTPS. Провайдеры подменяют A-записи Instagram на 127.0.0.1 (на живом
 # домашнем подключении это воспроизводится), и тогда CONNECT уходит в локальный
@@ -57,6 +60,12 @@ DNS_CACHE_TTL = 120
 RELAY_ENV = 'YT_PROXY_RELAY'
 RELAY_DOMAINS_ENV = 'YT_PROXY_RELAY_DOMAINS'
 RELAY_AUTH_ENV = 'YT_PROXY_RELAY_AUTH'
+
+# Резервные адреса для доменов, у которых провайдер блэкхолит DNS-ответ, но
+# другие адреса того же сервиса открыты (у Meta это обычная картина: 31.13.x
+# не проходит, а, например, 157.240.x отвечает). Формат:
+#   YT_PROXY_EXTRA_IPS=instagram.com,cdninstagram.com,fbcdn.net=157.240.205.174
+EXTRA_IPS_ENV = 'YT_PROXY_EXTRA_IPS'
 
 CA_KEY_FILE = 'ca.key'
 CA_CERT_FILE = 'ca.pem'
@@ -308,6 +317,7 @@ async def resolve_ips(host: str) -> list:
         return cached
 
     doh_first = env_flag('YT_PROXY_DOH_FIRST', False)
+    extras = _usable_ips(extra_ips(host))
     system = _usable_ips(_system_resolve(host))
     doh = []
 
@@ -318,12 +328,18 @@ async def resolve_ips(host: str) -> list:
             log.info(f'🌐 DNS по HTTPS для {host}: {", ".join(doh)}')
 
     if doh_first and doh:
-        ips = doh
+        resolved = doh
     else:
-        ips = system + [ip for ip in doh if ip not in system]
+        resolved = system + [ip for ip in doh if ip not in system]
 
+    # Резервные адреса идут первыми: они появились не просто так — обычно это
+    # единственный доступный edge сервиса, когда DNS-ответ заблэкхолен.
+    ips = extras + [ip for ip in resolved if ip not in extras]
     ips = ips or [host]
     _cache_put(host, ips)
+
+    if extras:
+        log.info(f'➕ Резервные адреса {host}: {", ".join(extras)}')
 
     return ips
 
@@ -471,6 +487,40 @@ def relay_auth_header() -> str:
     return 'Basic ' + base64.b64encode(raw.encode('utf-8')).decode('ascii')
 
 
+def extra_ips(host: str) -> list:
+    """Резервные адреса для хоста из YT_PROXY_EXTRA_IPS.
+
+    Запись: `domain[,domain]=ip[,ip]`, записи разделяются `;` или переводом строки.
+    Нужны, когда DNS отдаёт заблэкхоленный адрес, а соседний адрес сервиса жив:
+    так Instagram работает через доступный edge Meta.
+    """
+    raw = os.environ.get(EXTRA_IPS_ENV, '').strip()
+
+    if not raw:
+        return []
+
+    host = host.lower().rstrip('.')
+    result = []
+
+    for entry in raw.replace('\n', ';').split(';'):
+        entry = entry.strip()
+
+        if not entry or '=' not in entry:
+            continue
+
+        domains_part, ips_part = entry.split('=', 1)
+        domains = [item.strip().lower() for item in domains_part.split(',') if item.strip()]
+
+        if not host_in(host, domains):
+            continue
+
+        for ip in ips_part.replace(' ', '').split(','):
+            if ip and ip not in result:
+                result.append(ip)
+
+    return result
+
+
 async def open_via_relay(relay: tuple, host: str, port: int):
     """Просит релей открыть CONNECT к цели и возвращает готовый туннель."""
     relay_host, relay_port = relay
@@ -502,6 +552,59 @@ async def open_via_relay(relay: tuple, host: str, port: int):
         raise
 
 
+async def _race_connect(candidates: list):
+    """Пробует адреса одновременно: побеждает первый, кто ответил.
+
+    Часть SYN провайдер просто теряет, поэтому последовательный перебор
+    упирался в таймаут на каждом заблэкхоленном адресе. Гонка убирает эту
+    задержку: успевает тот адрес, где пакет всё-таки прошёл.
+    """
+    tasks = {
+        asyncio.create_task(
+            asyncio.wait_for(asyncio.open_connection(ip, port), timeout=CONNECT_ATTEMPT_TIMEOUT)
+        ): (ip, port)
+        for ip, port in candidates[:CONNECT_RACE_LIMIT]
+    }
+    pending = set(tasks)
+
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+            for task in done:
+                if task.cancelled():
+                    continue
+
+                error = task.exception()
+
+                if error is None:
+                    reader, writer = task.result()
+
+                    # Одновременно могли успеть несколько адресов — лишние
+                    # соединения закрываем, чтобы не копить сокеты.
+                    for other in done:
+                        if other is not task and not other.cancelled() and other.exception() is None:
+                            try:
+                                other.result()[1].close()
+                            except Exception:
+                                pass
+
+                    for rest in pending:
+                        rest.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                    return reader, writer
+
+                ip, port = tasks[task]
+                log.warning(f'⚠️ Апстрим {ip}:{port} недоступен: {error!r}')
+
+        return None
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+
 async def open_direct(host: str, port: int):
     """Открывает TCP к цели, перебирая адреса и повторяя заход при обрыве."""
     if host.lower() in DC_RELAY:
@@ -509,29 +612,27 @@ async def open_direct(host: str, port: int):
     else:
         candidates = [(ip, port) for ip in await resolve_ips(host)]
 
-    last_error = None
+    if not candidates:
+        candidates = [(host, port)]
 
     for round_no in range(1, CONNECT_ROUNDS + 1):
-        for ip, candidate_port in candidates:
-            try:
-                upstream_reader, upstream_writer = await asyncio.wait_for(
-                    asyncio.open_connection(ip, candidate_port),
-                    timeout=CONNECT_ATTEMPT_TIMEOUT,
-                )
-            except Exception as exc:
-                last_error = exc
-                log.warning(f'⚠️ Апстрим {ip}:{candidate_port} недоступен: {exc!r}')
-                continue
+        connection = await _race_connect(candidates)
 
-            if round_no > 1 or len(candidates) > 1:
-                log.info(f'✅ Соединение установлено: {host} -> {ip}:{candidate_port}')
-            return upstream_reader, upstream_writer
+        if connection is not None:
+            if len(candidates) > 1 or round_no > 1:
+                log.info(f'✅ Соединение установлено: {host} (круг {round_no})')
+            return connection
 
         if round_no < CONNECT_ROUNDS:
+            # Со второго круга начинаем с другого адреса: тот, что только что
+            # не ответил, повторять бессмысленно.
+            if len(candidates) > 1:
+                candidates = candidates[1:] + candidates[:1]
+
             # Пауза между кругами: блокировка «дырявая», повтор часто проходит.
             await asyncio.sleep(0.5)
 
-    raise ConnectionError(f'все адреса {host}:{port} недоступны ({last_error!r})')
+    raise ConnectionError(f'все адреса {host}:{port} недоступны')
 
 
 async def open_tunnel(host: str, port: int):
