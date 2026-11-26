@@ -461,10 +461,40 @@ def env_flag(name: str, default: bool) -> bool:
 
 
 def host_in(host: str, domains) -> bool:
-    """Домен совпадает сам или является поддоменом одного из списка."""
+    """Хост совпадает с записью списка: домен/поддомен, IP или IP-подсеть.
+
+    Подсети нужны для сервисов вроде Telegram: клиент ходит не только на
+    имена, но и на IP дата-центров, и без CIDR такой CONNECT не попал бы
+    в релей.
+    """
     host = host.lower().rstrip('.')
 
-    return any(host == domain or host.endswith('.' + domain) for domain in domains)
+    try:
+        address = ipaddress.ip_address(host.strip('[]'))
+    except ValueError:
+        address = None
+
+    for domain in domains:
+        if address is not None:
+            try:
+                if '/' in domain:
+                    if address in ipaddress.ip_network(domain, strict=False):
+                        return True
+                elif address == ipaddress.ip_address(domain):
+                    return True
+            except ValueError:
+                continue
+
+            continue
+
+        # Запись-адрес к имени не применима: пропускаем.
+        if _is_ip_literal(domain):
+            continue
+
+        if host == domain or host.endswith('.' + domain):
+            return True
+
+    return False
 
 
 def relay_endpoint() -> tuple:
@@ -737,7 +767,12 @@ async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.S
             await writer.drain()
             return
 
-        is_mitm = mitm_enabled() and is_mitm_host(target_host)
+        # Домен, отданный релею, не перехватываем: SNI-swap нужен был для
+        # обхода DPI по пути клиента, а релей ставит соединение со своей сети,
+        # где имена резолвятся нормально. Перехват здесь только сломал бы TLS.
+        relay = relay_endpoint()
+        relayed = bool(relay and host_in(target_host, relay_domains()))
+        is_mitm = mitm_enabled() and is_mitm_host(target_host) and not relayed
 
         if is_mitm:
             log.info(f"🎯 Направление трафика на MITM (внутренний TLS): {target_host}:{target_port}")
