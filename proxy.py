@@ -318,7 +318,16 @@ async def resolve_ips(host: str) -> list:
     if _is_ip_literal(host):
         return [host.strip('[]')]
 
-    if is_telegram_host(host):
+    # Для целей релея и белого списка системному DNS не верим: провайдер и
+    # хостер подменяют ответы (у Beget web.telegram.org временами указывал на
+    # старый релей, который теперь отдаёт чужой сайт). Там доверяем только DoH,
+    # а если он недоступен — остаётся системный DNS.
+    trusted_target = host_in(host, relay_domains()) or host_in(host, connect_allowlist())
+
+    # Старый путь Telegram — SNI-swap на внешний relay-nginx. Он остаётся только
+    # там, где релей не настроен: тот nginx давно отдаёт чужую страницу, и для
+    # домена, отданного нашему релею, нужен обычный DNS.
+    if is_telegram_host(host) and not trusted_target:
         return telegram_relay_ips()
 
     cached = _cache_get(host)
@@ -326,7 +335,7 @@ async def resolve_ips(host: str) -> list:
     if cached is not None:
         return cached
 
-    doh_first = env_flag('YT_PROXY_DOH_FIRST', False)
+    doh_first = env_flag('YT_PROXY_DOH_FIRST', False) or trusted_target
     extras = _usable_ips(extra_ips(host))
     system = _usable_ips(_system_resolve(host))
     doh = []
@@ -547,16 +556,21 @@ def connect_authorized(header: str) -> bool:
     return hmac.compare_digest(header.strip(), basic_auth_header(expected))
 
 
-def connect_target_allowed(host: str) -> bool:
-    """Белый список целей CONNECT (YT_PROXY_CONNECT_ALLOW), если он задан."""
+def connect_allowlist() -> list:
+    """Белый список целей CONNECT из YT_PROXY_CONNECT_ALLOW (пусто — не задан)."""
     raw = os.environ.get(CONNECT_ALLOW_ENV, '').strip()
 
     if not raw:
-        return True
+        return []
 
-    domains = [item.strip().lower() for item in raw.replace(';', ',').split(',') if item.strip()]
+    return [item.strip().lower() for item in raw.replace(';', ',').split(',') if item.strip()]
 
-    return host_in(host, domains)
+
+def connect_target_allowed(host: str) -> bool:
+    """Можно ли открыть туннель к хосту (пустой белый список — можно везде)."""
+    domains = connect_allowlist()
+
+    return not domains or host_in(host, domains)
 
 
 def extra_ips(host: str) -> list:
