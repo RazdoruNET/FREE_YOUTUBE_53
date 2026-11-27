@@ -1,0 +1,5 @@
+# Деплой без дашборда:  cd cloudflare && npx wrangler deploy
+# Секрет с ключом (необязательно):  npx wrangler secret put API_KEY
+name = "gemini-gw"
+main = "gemini-gateway.js"
+compatibility_date = "2026-01-01"

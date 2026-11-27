@@ -29,9 +29,10 @@ logging.basicConfig(
 log = logging.getLogger('yt-proxy')
 
 CERTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'certs')
-LISTEN_HOST = '127.0.0.1'
-PROXY_PORT = 8443        # Порт для настроек браузера/curl
-INTERNAL_TLS_PORT = 8444 # Внутренний порт для безопасного хендшейка
+# Адрес и порты можно переопределить: на VPS релей должен слушать 0.0.0.0.
+LISTEN_HOST = os.environ.get('YT_PROXY_LISTEN_HOST', '127.0.0.1')
+PROXY_PORT = int(os.environ.get('YT_PROXY_PORT', '8443'))        # Порт для настроек браузера/curl
+INTERNAL_TLS_PORT = int(os.environ.get('YT_PROXY_INTERNAL_PORT', '8444')) # Внутренний порт для безопасного хендшейка
 UPSTREAM_SNI = 'google.com'
 CONNECT_TIMEOUT = 10
 # Предел на одну попытку подключения к конкретному адресу: блокированные IP
@@ -61,6 +62,14 @@ DNS_CACHE_TTL = 120
 RELAY_ENV = 'YT_PROXY_RELAY'
 RELAY_DOMAINS_ENV = 'YT_PROXY_RELAY_DOMAINS'
 RELAY_AUTH_ENV = 'YT_PROXY_RELAY_AUTH'
+
+# Релей для Gemini API. Google отказывает по региону IP («User location is not
+# supported», без ключа — 403 ACCESS_DENIED), а это не DPI: подмена SNI здесь
+# бесполезна, запрос должен выйти из поддерживаемой страны. Поэтому домены
+# Gemini уходят в отдельный релей, если он задан: страна, где живёт релей для
+# Instagram, и страна, которую пускает Gemini, — разные вещи.
+GEMINI_RELAY_ENV = 'YT_PROXY_GEMINI_RELAY'
+GEMINI_RELAY_AUTH_ENV = 'YT_PROXY_GEMINI_RELAY_AUTH'
 
 # Настройки самого релея (серверная сторона). Если YT_PROXY_AUTH задан,
 # CONNECT без верного Proxy-Authorization отклоняется (407). Если задан
@@ -450,6 +459,21 @@ TIKTOK_DOMAINS = [
     'byteoversea.com',
 ]
 SOCIAL_DOMAINS = INSTAGRAM_DOMAINS + TIKTOK_DOMAINS
+# Gemini: Google блокирует по стране IP, поэтому TLS остаётся сквозным (MITM тут
+# вреден — клиент должен видеть настоящий сертификат Google), а маршрутизация
+# решается релеем в поддерживаемой стране (YT_PROXY_GEMINI_RELAY).
+GEMINI_DOMAINS = [
+    'generativelanguage.googleapis.com',   # Gemini API и OpenAI-совместимый слой
+    'cloudcode-pa.googleapis.com',         # Code Assist — сюда ходит Gemini CLI после входа в Google
+    'aiplatform.googleapis.com',           # Vertex AI
+    'oauth2.googleapis.com',               # обновление OAuth-токенов CLI
+    'accounts.google.com',                 # экран входа в Google
+    'www.googleapis.com',                  # discovery-документы и userinfo
+    'play.googleapis.com',                 # эксперименты и квоты CLI
+    'cloudresourcemanager.googleapis.com', # выбор проекта в CLI
+    'iamcredentials.googleapis.com',
+    'monitoring.googleapis.com',           # телеметрия Gemini CLI
+]
 MITM_DOMAINS = YOUTUBE_DOMAINS + TELEGRAM_DOMAINS
 
 # Apex-домены CDN, к которым браузер не обращается напрямую (только поддомены):
@@ -524,11 +548,11 @@ def relay_endpoint() -> tuple:
 
 
 def relay_domains() -> list:
-    """Домены, которые уходят через релей: YT_PROXY_RELAY_DOMAINS или Instagram+TikTok."""
+    """Домены, которые уходят через общий релей: YT_PROXY_RELAY_DOMAINS или Instagram+TikTok+Gemini."""
     raw = os.environ.get(RELAY_DOMAINS_ENV, '').strip()
 
     if not raw:
-        return list(SOCIAL_DOMAINS)
+        return list(SOCIAL_DOMAINS + GEMINI_DOMAINS)
 
     return [item.strip().lower() for item in raw.replace(';', ',').split(',') if item.strip()]
 
@@ -546,6 +570,55 @@ def relay_auth_header() -> str:
 def basic_auth_header(credentials: str) -> str:
     value = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
     return f'Basic {value}'
+
+
+def is_gemini_host(host: str) -> bool:
+    """Хост относится к Gemini / Gemini CLI."""
+    return host_in(host, GEMINI_DOMAINS)
+
+
+def gemini_relay_endpoint() -> tuple:
+    """Адрес релея для Gemini из YT_PROXY_GEMINI_RELAY или None."""
+    raw = os.environ.get(GEMINI_RELAY_ENV, '').strip()
+
+    if not raw:
+        return None
+
+    return parse_host_port(raw, 8443)
+
+
+def gemini_relay_auth_header() -> str:
+    """Пароль релея Gemini: YT_PROXY_GEMINI_RELAY_AUTH, а для того же адреса, что и общий релей, — YT_PROXY_RELAY_AUTH."""
+    raw = os.environ.get(GEMINI_RELAY_AUTH_ENV, '').strip()
+
+    if raw:
+        return basic_auth_header(raw)
+
+    if gemini_relay_endpoint() == relay_endpoint():
+        return relay_auth_header()
+
+    return ''
+
+
+def relay_target(host: str):
+    """(endpoint, auth_header) релея для хоста или None.
+
+    Сначала отдельный релей Gemini, затем общий — но только для доменов из его
+    списка. Так трафик Gemini можно вывести в другую страну, не трогая
+    маршрутизацию Instagram/Telegram.
+    """
+    if is_gemini_host(host):
+        endpoint = gemini_relay_endpoint()
+
+        if endpoint:
+            return endpoint, gemini_relay_auth_header()
+
+    endpoint = relay_endpoint()
+
+    if endpoint and host_in(host, relay_domains()):
+        return endpoint, relay_auth_header()
+
+    return None
 
 
 def mitm_enabled() -> bool:
@@ -614,7 +687,7 @@ def extra_ips(host: str) -> list:
     return result
 
 
-async def open_via_relay(relay: tuple, host: str, port: int):
+async def open_via_relay(relay: tuple, host: str, port: int, auth: str = ''):
     """Просит релей открыть CONNECT к цели и возвращает готовый туннель."""
     relay_host, relay_port = relay
     reader, writer = await asyncio.wait_for(
@@ -623,7 +696,6 @@ async def open_via_relay(relay: tuple, host: str, port: int):
 
     try:
         lines = [f'CONNECT {host}:{port} HTTP/1.1', f'Host: {host}:{port}']
-        auth = relay_auth_header()
 
         if auth:
             lines.append(f'Proxy-Authorization: {auth}')
@@ -730,12 +802,13 @@ async def open_direct(host: str, port: int):
 
 async def open_tunnel(host: str, port: int):
     """Туннель к цели: через релей, если он настроен для этого домена, иначе напрямую."""
-    relay = relay_endpoint()
+    target = relay_target(host)
 
-    if relay and host_in(host, relay_domains()):
+    if target is not None:
+        relay, auth = target
         try:
             log.info(f'🛰️ Через релей {relay[0]}:{relay[1]}: {host}:{port}')
-            return await open_via_relay(relay, host, port)
+            return await open_via_relay(relay, host, port, auth)
         except Exception as exc:
             log.warning(f'⚠️ Релей не открыл {host}:{port}: {exc!r}')
             log.info('↩️ Пробуем напрямую')
@@ -791,8 +864,7 @@ async def handle_connect_request(reader: asyncio.StreamReader, writer: asyncio.S
         # Домен, отданный релею, не перехватываем: SNI-swap нужен был для
         # обхода DPI по пути клиента, а релей ставит соединение со своей сети,
         # где имена резолвятся нормально. Перехват здесь только сломал бы TLS.
-        relay = relay_endpoint()
-        relayed = bool(relay and host_in(target_host, relay_domains()))
+        relayed = relay_target(target_host) is not None
         is_mitm = mitm_enabled() and is_mitm_host(target_host) and not relayed
 
         if is_mitm:
@@ -1376,6 +1448,196 @@ def cli_check_social(name: str) -> int:
     return 0
 
 
+def _gemini_verdict(status: int, body: str) -> str:
+    """Классифицирует ответ Gemini API: ok / geo / key / nokey / other.
+
+    Регион проверяется только у авторизованного запроса, поэтому вердикт даёт
+    лишь запрос с валидным ключом. Без ключа Google отвечает одинаково и из
+    поддерживаемой страны, и из заблокированной («Permission denied on the
+    service»), — это отказ анонимному клиенту, а не вердикт по региону.
+    """
+    text = (body or '').lower()
+
+    if 'location is not supported' in text:
+        return 'geo'
+
+    if 200 <= status < 300:
+        return 'ok'
+
+    if 'api key' in text or 'api_key_invalid' in text:
+        return 'key'
+
+    if 'permission denied on the service' in text:
+        return 'nokey'
+
+    return 'other'
+
+
+GEMINI_VERDICT_TEXT = {
+    'ok': '✅ регион поддерживается',
+    'geo': '❌ отказ по региону: запрос должен выходить из поддерживаемой страны',
+    'key': '⚠️ ключ не принят',
+    'nokey': '• Google не пускает без ключа — о регионе это ничего не говорит',
+    'other': '❓ неожиданный ответ',
+}
+
+
+def _gemini_exchange(sock, host: str, path: str, key: str) -> tuple:
+    """GET к Gemini через уже открытый TLS-сокет: (код ответа, начало тела)."""
+    lines = [
+        f'GET {path} HTTP/1.1',
+        f'Host: {host}',
+        'Accept: application/json',
+        'User-Agent: yt-proxy-check',
+        'Connection: close',
+    ]
+
+    if key:
+        lines.append(f'x-goog-api-key: {key}')
+
+    sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode('latin-1'))
+
+    raw = b''
+
+    while len(raw) < 65536:
+        chunk = sock.recv(65536)
+
+        if not chunk:
+            break
+
+        raw += chunk
+
+    head, _, body = raw.partition(b'\r\n\r\n')
+    status_line = head.split(b'\r\n', 1)[0].decode('latin-1')
+
+    try:
+        status = int(status_line.split(' ')[1])
+    except (IndexError, ValueError):
+        status = 0
+
+    return status, body.decode('utf-8', errors='replace')
+
+
+def _gemini_probe_direct(ips: list, host: str, path: str, key: str) -> tuple:
+    """Пробует HTTPS напрямую по каждому адресу: (адрес, код, тело)."""
+    last_error = None
+
+    for ip in ips:
+        sock = None
+        try:
+            sock = socket.create_connection((ip, 443), timeout=CONNECT_ATTEMPT_TIMEOUT)
+        except OSError as exc:
+            last_error = exc
+            continue
+
+        try:
+            with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
+                return ip, *_gemini_exchange(tls, host, path, key)
+        except Exception as exc:
+            last_error = exc
+        finally:
+            sock.close()
+
+    raise ConnectionError(f'нет TLS ни к одному адресу {host}: {last_error!r}')
+
+
+def _gemini_probe_relay(relay: tuple, auth: str, host: str, path: str, key: str) -> tuple:
+    """То же, но через релей: CONNECT, затем TLS и запрос."""
+    sock = socket.create_connection(relay, timeout=CONNECT_TIMEOUT)
+
+    try:
+        lines = [f'CONNECT {host}:443 HTTP/1.1', f'Host: {host}:443']
+
+        if auth:
+            lines.append(f'Proxy-Authorization: {auth}')
+
+        sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode('latin-1'))
+
+        head = b''
+
+        while b'\r\n\r\n' not in head:
+            chunk = sock.recv(4096)
+
+            if not chunk:
+                raise ConnectionError('релей закрыл соединение')
+
+            head += chunk
+
+        status_line = head.split(b'\r\n', 1)[0].decode('latin-1')
+
+        if b' 200' not in status_line.encode('latin-1'):
+            raise ConnectionError(f'релей ответил: {status_line}')
+
+        with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
+            return relay[0], *_gemini_exchange(tls, host, path, key)
+    finally:
+        sock.close()
+
+
+def cli_check_gemini() -> int:
+    """`--check-gemini`: пускает ли Gemini текущая сеть и релей YT_PROXY_GEMINI_RELAY."""
+    host = 'generativelanguage.googleapis.com'
+    path = '/v1beta/models'
+    key = os.environ.get('GEMINI_API_KEY', '').strip()
+    target = relay_target(host)
+
+    log.info(
+        f"Проверка Gemini API: ключ={'есть' if key else 'нет — вердикт будет приблизительным'}, "
+        f"релей={target[0][0] + ':' + str(target[0][1]) if target else 'нет'}"
+    )
+
+    results = []
+
+    log.info(f'-- напрямую ({host})')
+    try:
+        address, status, body = _gemini_probe_direct(
+            asyncio.run(resolve_ips(host)), host, path, key
+        )
+        verdict = _gemini_verdict(status, body)
+        log.info(f'   {address}: HTTP {status} — {GEMINI_VERDICT_TEXT[verdict]}')
+        results.append(verdict)
+    except Exception as exc:
+        log.error(f'   нет соединения: {exc!r}')
+
+    if target:
+        relay, auth = target
+        log.info(f'-- через релей ({relay[0]}:{relay[1]})')
+        try:
+            address, status, body = _gemini_probe_relay(relay, auth, host, path, key)
+            verdict = _gemini_verdict(status, body)
+            log.info(f'   {address}: HTTP {status} — {GEMINI_VERDICT_TEXT[verdict]}')
+            results.append(verdict)
+        except Exception as exc:
+            log.error(f'   релей не сработал: {exc!r}')
+
+    if 'ok' in results:
+        log.info('✅ Gemini API доступен: регион поддерживается')
+        return 0
+
+    if 'geo' in results:
+        log.error('❌ Gemini отвечает отказом по региону — подмена SNI тут не поможет')
+        log.info(
+            '💡 Нужен выход из поддерживаемой страны: '
+            f'{GEMINI_RELAY_ENV}=host:port (HTTP-прокси на VPS за границей) '
+            'или бесплатный Cloudflare Worker, см. раздел Gemini в README'
+        )
+        return 1
+
+    if 'key' in results:
+        log.error('❌ Google не принял ключ: вердикт по региону без валидного ключа невозможен')
+        log.info('💡 Задайте рабочий ключ: GEMINI_API_KEY=AIza... python3 proxy.py --check-gemini')
+        return 1
+
+    if 'nokey' in results:
+        log.error('❌ Без ключа регион не проверить: Google отказывает анонимным запросам одинаково везде')
+        log.info('💡 Задайте ключ: GEMINI_API_KEY=AIza... python3 proxy.py --check-gemini')
+        return 1
+
+    log.error('❌ Gemini API недоступен: ни напрямую, ни через релей проверка не прошла')
+    log.info(f'💡 Задайте релей: {GEMINI_RELAY_ENV}=host:port, при пароле — {GEMINI_RELAY_AUTH_ENV}=user:pass')
+    return 1
+
+
 def cli_check_certs() -> int:
     """`--check-certs`: только проверка сертификатов, без запуска прокси."""
     errors, warnings = inspect_certs()
@@ -1399,6 +1661,8 @@ if __name__ == '__main__':
         sys.exit(cli_check_social('instagram'))
     if '--check-tiktok' in args:
         sys.exit(cli_check_social('tiktok'))
+    if '--check-gemini' in args:
+        sys.exit(cli_check_gemini())
     if '--scan-telegram' in args:
         sys.exit(cli_scan_telegram())
     if '--regen-certs' in args:

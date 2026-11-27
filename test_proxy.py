@@ -1,6 +1,9 @@
 import asyncio
+import os
 import subprocess
 import sys
+
+PROXY_PORT = int(os.environ.get("YT_PROXY_PORT", "8443"))
 
 async def read_logs(proc):
     try:
@@ -48,37 +51,37 @@ async def main():
     success = True
     try:
         # 1. Test non-YouTube domain (e.g., example.com)
-        resp = await test_domain("127.0.0.1", 8443, "example.com", 80)
+        resp = await test_domain("127.0.0.1", PROXY_PORT, "example.com", 80)
         if "200 Connection Established" not in resp:
             print(f"❌ Failed for example.com: {resp}", flush=True)
             success = False
         
         # 2. Test YouTube domain (e.g., youtube.com)
-        resp = await test_domain("127.0.0.1", 8443, "youtube.com", 443)
+        resp = await test_domain("127.0.0.1", PROXY_PORT, "youtube.com", 443)
         if "200 Connection Established" not in resp:
             print(f"❌ Failed for youtube.com: {resp}", flush=True)
             success = False
 
         # 3. Test Telegram domain (e.g., telegram.org)
-        resp = await test_domain("127.0.0.1", 8443, "telegram.org", 443)
+        resp = await test_domain("127.0.0.1", PROXY_PORT, "telegram.org", 443)
         if "200 Connection Established" not in resp:
             print(f"❌ Failed for telegram.org: {resp}", flush=True)
             success = False
 
         # 4. Test web.telegram.org (SNI-swap target)
-        resp = await test_domain("127.0.0.1", 8443, "web.telegram.org", 443)
+        resp = await test_domain("127.0.0.1", PROXY_PORT, "web.telegram.org", 443)
         if "200 Connection Established" not in resp:
             print(f"❌ Failed for web.telegram.org: {resp}", flush=True)
             success = False
 
         # 5. Test td.ru domain
-        resp = await test_domain("127.0.0.1", 8443, "td.ru", 443)
+        resp = await test_domain("127.0.0.1", PROXY_PORT, "td.ru", 443)
         if "200 Connection Established" not in resp:
             print(f"❌ Failed for td.ru: {resp}", flush=True)
             success = False
 
         # 6. Test t.me domain
-        resp = await test_domain("127.0.0.1", 8443, "t.me", 443)
+        resp = await test_domain("127.0.0.1", PROXY_PORT, "t.me", 443)
         if "200 Connection Established" not in resp:
             print(f"❌ Failed for t.me: {resp}", flush=True)
             success = False
@@ -87,8 +90,15 @@ async def main():
         # зависит от сети: часть адресов Meta провайдер блэкхолит, поэтому
         # печатаем результат, но из-за него тест не валим.
         for social in ("www.instagram.com", "www.tiktok.com"):
-            resp = await test_domain("127.0.0.1", 8443, social, 443)
+            resp = await test_domain("127.0.0.1", PROXY_PORT, social, 443)
             print(f"ℹ️ {social}: {resp} (проверка сети, на итог не влияет)", flush=True)
+
+        # 8. Gemini API: тоже без MITM — клиент должен видеть настоящий
+        # сертификат Google, иначе ключ попадёт в перехваченный поток.
+        resp = await test_domain("127.0.0.1", PROXY_PORT, "generativelanguage.googleapis.com", 443)
+        if "200 Connection Established" not in resp:
+            print(f"❌ Failed for generativelanguage.googleapis.com: {resp}", flush=True)
+            success = False
             
     except Exception as e:
         print(f"❌ Exception occurred during test: {e}", flush=True)

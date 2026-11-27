@@ -18,8 +18,8 @@ DPI? Ебанулся какой нахуй DPI это килотонны баб
 Завтра дополню обработчиком маршрутов что бы он не ломал трафик на других сайтах.
 А пока вот вам рабочий болд наслаждайся:
 
-## SNI-Swap Forward Proxy (YouTube + Telegram + Instagram/TikTok)
-Высокопроизводительный асинхронный Forward-прокси на Python для обхода глубокого анализа пакетов (DPI) и ограничений доступа к YouTube и Telegram методом SNI-Swap (подмены заголовка Server Name Indication на google.com). Instagram и TikTok прокси тоже обслуживает, но без подмены SNI — для них включены DNS по HTTPS, перебор адресов и необязательный релей (см. раздел ниже).
+## SNI-Swap Forward Proxy (YouTube + Telegram + Instagram/TikTok + Gemini API)
+Высокопроизводительный асинхронный Forward-прокси на Python для обхода глубокого анализа пакетов (DPI) и ограничений доступа к YouTube и Telegram методом SNI-Swap (подмены заголовка Server Name Indication на google.com). Instagram и TikTok прокси тоже обслуживает, но без подмены SNI — для них включены DNS по HTTPS, перебор адресов и необязательный релей (см. раздел ниже). Gemini API — отдельная история: Google отказывает по стране IP, поэтому там нужен релей в поддерживаемой стране (раздел «Gemini API и Gemini CLI»).
 
 ------------------------------
 
@@ -66,6 +66,7 @@ DPI? Ебанулся какой нахуй DPI это килотонны баб
    python3 proxy.py --check-certs     # только проверка сертификатов, без запуска
    python3 proxy.py --regen-certs     # принудительный перевыпуск (нужно заново импортировать cert.pem!)
    python3 proxy.py --check-telegram  # проверить доступность релея и DC Telegram
+   python3 proxy.py --check-gemini    # пускает ли Gemini текущая сеть и релей
    python3 proxy.py --scan-telegram   # найти хоть один незаблокированный адрес DC Telegram
 
    Директория certs/ добавлена в .gitignore: приватные ключи не попадают в репозиторий.
@@ -194,3 +195,104 @@ python3 proxy.py --scan-telegram
 
 Если молчат все адреса — нужен релей или VPN: подмена SNI здесь не поможет.
 
+
+------------------------------
+## 🤖 Gemini API и Gemini CLI
+
+Google отказывает не по SNI, а по **стране IP**: с российского адреса `generativelanguage.googleapis.com` отвечает `403 ACCESS_DENIED` («Permission denied on the service»), а с ключом — `400 FAILED_PRECONDITION` / «User location is not supported for the API use». Ни подмена SNI, ни DNS по HTTPS здесь не помогают: запрос должен физически выйти из поддерживаемой страны. Поэтому домены Gemini прокси отправляет в релей, отдельный от Instagram/Telegram:
+
+    YT_PROXY_GEMINI_RELAY=vps.example.com:8443   # HTTP-прокси на хосте за границей
+    YT_PROXY_GEMINI_RELAY_AUTH=user:pass         # если релей просит пароль
+
+Если `YT_PROXY_GEMINI_RELAY` не задан, домены Gemini идут через общий `YT_PROXY_RELAY` — они входят в его список по умолчанию. TLS для Gemini остаётся сквозным: прокси не расшифровывает этот трафик, клиент видит настоящий сертификат Google, поэтому импортировать `certs/cert.pem` для Gemini не нужно.
+
+В релей уходят домены из списка `GEMINI_DOMAINS` в `proxy.py`: `generativelanguage.googleapis.com`, `cloudcode-pa.googleapis.com`, `aiplatform.googleapis.com`, `oauth2.googleapis.com`, `accounts.google.com`, `www.googleapis.com`, `play.googleapis.com`, `cloudresourcemanager.googleapis.com`, `iamcredentials.googleapis.com`, `monitoring.googleapis.com`. Переменная `YT_PROXY_RELAY_DOMAINS` по-прежнему перекрывает список общего релея целиком, но на отдельный релей Gemini она не влияет.
+
+### Диагностика
+
+    python3 proxy.py --check-gemini
+
+Скрипт делает по одному запросу к `/v1beta/models` напрямую и через релей и выносит вердикт: «регион поддерживается», «отказ по региону» или «ключ не принят». Вердикт по региону возможен только с ключом: без него Google одинаково отвечает «Permission denied on the service» и из поддерживаемой страны, и из заблокированной — это отказ анонимному клиенту, а не проверка местоположения. Полноценная проверка:
+
+    GEMINI_API_KEY=AIza... python3 proxy.py --check-gemini
+
+### Куда взять релей, если своего сервера нет
+
+**Вариант 1 — Cloudflare Worker (бесплатно, без карты).** Worker исполняется в дата-центре Cloudflare за пределами РФ и ходит в Google уже оттуда:
+
+   1. dash.cloudflare.com → Workers & Pages → Create → Worker.
+   2. Вставить содержимое `cloudflare/gemini-gateway.js`, нажать Deploy. Адрес будет вида `https://gemini-gw.<аккаунт>.workers.dev`.
+   3. По желанию: Settings → Variables → секрет `API_KEY` с вашим Gemini-ключом — тогда Worker обслужит только запросы с этим ключом.
+
+Проверить Worker можно до деплоя — тест поднимает локальный апстрим и гоняет запросы через обработчик:
+
+    node cloudflare/gemini-gateway.test.mjs
+
+После деплоя видно, откуда Worker выходит в интернет (именно эту страну видит Google):
+
+    curl -s https://gemini-gw.<аккаунт>.workers.dev/health   # colo — дата-центр Cloudflare
+    curl -s https://gemini-gw.<аккаунт>.workers.dev/egress   # ip и country выхода
+
+Если `country` показывает `RU`, включите Smart Placement (`placement = { mode = "smart" }` в `wrangler.toml`) — Worker начнёт исполняться ближе к апстриму, а не к вам.
+
+Gemini CLI через Worker:
+
+    export GOOGLE_GEMINI_BASE_URL=https://gemini-gw.<аккаунт>.workers.dev
+    export GEMINI_API_KEY=AIza...
+    gemini
+
+**Вариант 2 — свой VPS.** На сервере за границей тот же `proxy.py` работает релеем (без MITM, с паролем и на внешнем адресе):
+
+    YT_PROXY_LISTEN_HOST=0.0.0.0 YT_PROXY_AUTH=user:pass YT_PROXY_NO_MITM=1 python3 proxy.py
+
+На своей машине:
+
+    YT_PROXY_GEMINI_RELAY=<ip-vps>:8443 YT_PROXY_GEMINI_RELAY_AUTH=user:pass python3 proxy.py
+
+Адрес и порты самого прокси настраиваются переменными `YT_PROXY_LISTEN_HOST`, `YT_PROXY_PORT` (по умолчанию 8443) и `YT_PROXY_INTERNAL_PORT` (8444).
+
+### Gemini CLI
+
+Через локальный прокси (нужен релей из варианта 2):
+
+    HTTPS_PROXY=http://127.0.0.1:8443 GEMINI_API_KEY=AIza... gemini
+
+`HTTP_PROXY`/`HTTPS_PROXY` Gemini CLI понимает, а `NO_PROXY=localhost,127.0.0.1` избавит локальные запросы от лишнего круга.
+
+### VS Code, Copilot Chat (BYOK)
+
+Модели Google добавляются в чат через «Manage Models…» в списке моделей. Два пути.
+
+**Через Worker — без локального прокси и без релея.** В «Manage Models…» выберите *Custom Endpoint* (в старых сборках — *OpenAI Compatible*), введите Gemini API key и добавьте модель:
+
+   * id и name: имя модели из ответа API, например `gemini-2.5-flash`;
+   * URL: `https://gemini-gw.<аккаунт>.workers.dev/v1beta/openai/chat/completions`;
+   * tool calling и vision — включить, `maxInputTokens` — 1048576, `maxOutputTokens` — 65536.
+
+Список доступных моделей и заодно проверка Worker:
+
+    curl -s -H "x-goog-api-key: $GEMINI_API_KEY" \
+      https://gemini-gw.<аккаунт>.workers.dev/v1beta/models | head -40
+
+Worker отдаёт OpenAI-совместимый слой Gemini, поэтому VS Code видит обычный Chat Completions-эндпоинт, а модель появляется в списке выбора.
+
+**Через локальный прокси — нужен релей из варианта 2.** В «Manage Models…» выберите *Google* (Gemini) и вставьте ключ, а трафик Copilot направьте в прокси настройками:
+
+    "http.proxy": "http://127.0.0.1:8443",
+    "http.proxySupport": "on",
+    "http.noProxy": ["localhost", "127.0.0.1"]
+
+Затем `Developer: Reload Window`. Учтите: `http.proxy` действует на весь сетевой слой расширений (включая запросы к GitHub), поэтому прокси должен быть запущен — без него чат не ответит.
+
+**Расширение: модели Gemini прямо в списке чата.** В репозитории лежит маленькое расширение `vscode-extension/` — оно регистрирует свой LanguageModelChatProvider и показывает модели Gemini из вашего Worker в списке моделей, без ручной сборки Custom Endpoint:
+
+    cd vscode-extension && ./install.sh
+
+Затем Command Palette → «Developer: Reload Window» → список моделей → «Gemini (Cloudflare)». Ключ хранится в SecretStorage: Command Palette → «Gemini (Worker): задать API-ключ». Адрес шлюза — настройка `geminiWorker.baseUrl`, состояние и ошибки — команда «Gemini (Worker): статус». Тесты расширения идут без VS Code: `node vscode-extension/test/extension.test.js`.
+
+**Свои приложения** работают с обычным ключом:
+
+    export HTTPS_PROXY=http://127.0.0.1:8443
+    export GEMINI_API_KEY=AIza...
+
+Для OpenAI-совместимых клиентов base URL — `https://generativelanguage.googleapis.com/v1beta/openai` (напрямую либо через Worker).
